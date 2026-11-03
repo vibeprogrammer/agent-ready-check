@@ -1,0 +1,45 @@
+{
+  "name": "agent-ready-check",
+  "version": "0.1.0",
+  "description": "Check how agent-ready a website is: 113 checks across 13 layers from The Agent-Ready Web, with evidence, fixes, an isitagentready-compatible level and a Lighthouse Agentic view. JSON API, MCP server, WebMCP, CLI.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Maxim Salnikov",
+  "repository": { "type": "git", "url": "git+https://github.com/vibeprogrammer/agent-ready-check.git" },
+  "homepage": "https://github.com/vibeprogrammer/agent-ready-check#readme",
+  "keywords": ["agent-ready", "ai-agents", "mcp", "webmcp", "llms.txt", "robots.txt", "isitagentready", "lighthouse", "accessibility"],
+  "engines": { "node": ">=22" },
+  "bin": { "agent-ready-check": "bin/agent-ready-check.mjs" },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./core": "./src/core/scan.mjs",
+    "./browser": "./src/browser/collect.mjs",
+    "./catalog": "./src/catalog.json"
+  },
+  "files": ["bin", "src", "public", "README.md", "LICENSE"],
+  "scripts": {
+    "start": "node server/node.mjs",
+    "lint": "eslint .",
+    "test": "node --test \"test/unit/**/*.test.mjs\"",
+    "test:fixtures": "node --test \"test/fixtures/**/*.test.mjs\"",
+    "test:e2e": "playwright test",
+    "build:worker": "node scripts/build-worker.mjs",
+    "scan": "node bin/agent-ready-check.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.10.0",
+    "linkedom": "^0.18.0",
+    "yaml": "^2.6.0"
+  },
+  "optionalDependencies": {
+    "axe-core": "^4.10.0",
+    "playwright-core": "^1.50.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.20.0",
+    "@eslint/js": "^9.20.0",
+    "globals": "^15.0.0"
+  }
+}
