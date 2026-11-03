@@ -209,6 +209,18 @@ export default {
         return { ...q, ex, ok: ex.ok && !!j, ad: !!j?.AD, service };
       }));
       const evidence = res.map((r) => r.ex);
+      // A wildcard (*.example.com) answers every name, _agents labels included. Ask for a random sibling label:
+      // if it gets the same records, the "_agents" answers come from the wildcard, not from DNS-AID.
+      if (res.some((r) => r.service.length)) {
+        const probe = `_zz${Math.random().toString(36).slice(2, 8)}._agents.${host}`;
+        const pex = await ctx.fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(probe)}&type=HTTPS`, { headers: { accept: 'application/dns-json' }, accept: 'application/dns-json', purpose: 'dns-aid wildcard probe' });
+        let pj = null; try { pj = JSON.parse(pex.text); } catch { /* not JSON */ }
+        const wild = (pj?.Answer || []).some((a) => a.type === 64 || a.type === 65);
+        if (wild) {
+          const details = { wildcard: true, probe, lookups: res.map((r) => ({ name: r.name, type: r.type, records: r.service.length, ad: r.ad })) };
+          return fail(`No DNS-AID records: the answers under _agents.${host} come from a wildcard (a random name, ${probe}, gets the same records).`, { evidence: [...evidence, pex], details, compat: { status: 'fail', message: 'no DNSSEC-validated SVCB/HTTPS records under _agents (wildcard only)' } });
+        }
+      }
       if (res.every((r) => !r.ok)) return error('DNS-over-HTTPS lookups failed, so DNS-AID could not be checked.', { evidence, compat: { status: 'unableToCheck', message: 'DoH lookup failed' } });
       const signed = res.find((r) => r.ad && r.service.length);
       const details = { lookups: res.map((r) => ({ name: r.name, type: r.type, records: r.service.length, ad: r.ad })) };

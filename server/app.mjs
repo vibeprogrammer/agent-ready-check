@@ -1,6 +1,7 @@
 // The Hono app shared by the Node server, Docker/Azure and the Cloudflare Worker. Runtime-neutral:
 // no node: imports. Runtime specifics (scan function, store, rate limiter, static assets) are injected.
 import { Hono } from 'hono';
+import { compress } from 'hono/compress';
 import { normalizeUrl } from '../src/core/scan.mjs';
 import { isBlockedIP, isIPLiteral } from '../src/core/net.mjs';
 import { CHECKS, LAYERS, catalog } from '../src/checks/index.mjs';
@@ -68,6 +69,9 @@ export function createApp(o) {
   } = o;
   const R = { ...defaultRenderers, ...renderers };
   const app = new Hono();
+  // gzip/deflate for text responses of 1 KB or more on Node (event streams excluded by the middleware). On Workers
+  // the runtime compresses on the wire when Content-Encoding is set (server/worker.mjs), so the app must not.
+  if (runtime === 'node') app.use('*', compress());
   const cache = new Map(); // key -> { report, at }
   const inflight = new Map(); // key -> promise
   let selfScans = 0;
@@ -153,10 +157,10 @@ export function createApp(o) {
     const withUrl = (r) => ({ ...r, report_url: r.id ? `${base}/r/${r.id}` : null });
 
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.at < cacheMs) return { report: withUrl(hit.report), cached: true };
+    if (hit && Date.now() - hit.at < cacheMs && !hit.report.mode?.browser_error) return { report: withUrl(hit.report), cached: true };
     if (store?.latestForUrl) {
       const prev = await store.latestForUrl(url.href, cacheMs).catch(() => null);
-      if (prev && !!prev.mode?.browser === useBrowser) { cache.set(key, { report: prev, at: Date.parse(prev.scanned_at) || Date.now() }); return { report: withUrl(prev), cached: true }; }
+      if (prev && !!prev.mode?.browser === useBrowser && !prev.mode?.browser_error) { cache.set(key, { report: prev, at: Date.parse(prev.scanned_at) || Date.now() }); return { report: withUrl(prev), cached: true }; }
     }
     if (inflight.has(key)) return { report: withUrl(await inflight.get(key)), cached: true };
 
