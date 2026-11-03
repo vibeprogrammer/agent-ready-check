@@ -4,7 +4,7 @@ Check how ready a website is for AI agents. **113 checks in 13 layers**, from th
 
 It is built on the book **"The Agent-Ready Web"** by Maxim Salnikov and its demos ([webmaxru/agent-ready-web-demos](https://github.com/webmaxru/agent-ready-web-demos), MIT): every check cites the chapter that explains it and the standard behind it, with that standard's status (RFC, W3C Recommendation, draft, vendor proposal), so you do not over-invest in drafts.
 
-> **Live instance:** https://agent-ready-check.sites.tab.bot (deployed 3 November 2026; a Cloudflare Worker with D1 for reports, plus a small browser runner for the browser checks). It scores itself 99/100, isitagentready Level 4 by our computation and by Cloudflare's own scanner, and 1.0 on the Lighthouse Agentic view.
+> **Live instance:** https://agent-ready-check.sites.tab.bot (deployed 3 November 2026; a Cloudflare Worker with D1 for reports, plus a small browser runner for the browser checks). It scores itself 100/100 (rounded; the one failing check is DNS-AID, which needs DNS records this host cannot publish), isitagentready Level 4 by our computation and by Cloudflare's own scanner, and 1.0 on the Lighthouse Agentic view.
 
 ## Compared with isitagentready.com
 
