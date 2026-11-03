@@ -4,6 +4,7 @@
 //                           [--level-at-least N] [--only id,id] [--timeout S] [--help] [--version]
 // Exit codes: 0 ok, 1 a gate failed (--fail-under / --level-at-least), 2 usage or scan error.
 import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 
 export const USAGE = `Usage: agent-ready-check <url> [options]
@@ -123,7 +124,9 @@ export async function main(argv = process.argv.slice(2), io = { out: (s) => proc
   return failed.length ? 1 : 0;
 }
 
-if (process.argv[1] && resolvePath(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// npx and npm link start the CLI through a symlink, so compare real paths.
+const realOrSame = (p) => { try { return realpathSync(p); } catch { return p; } };
+if (process.argv[1] && realOrSame(resolvePath(process.argv[1])) === realOrSame(fileURLToPath(import.meta.url))) {
   // Exit once stdout has drained, so open keep-alive sockets or a browser cannot hold the process.
   main().then((code) => { process.stdout.write('', () => process.exit(code)); });
 }

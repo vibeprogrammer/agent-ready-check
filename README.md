@@ -4,7 +4,7 @@ Check how ready a website is for AI agents. **113 checks in 13 layers**, from th
 
 It is built on the book **"The Agent-Ready Web"** by Maxim Salnikov and its demos ([webmaxru/agent-ready-web-demos](https://github.com/webmaxru/agent-ready-web-demos), MIT): every check cites the chapter that explains it and the standard behind it, with that standard's status (RFC, W3C Recommendation, draft, vendor proposal), so you do not over-invest in drafts.
 
-> **Live instance:** _(the lead fills this in: URL, date)_
+> **Live instance:** https://agent-ready-check.sites.tab.bot (deployed 3 November 2026; a Cloudflare Worker with D1 for reports, plus a small browser runner for the browser checks). It scores itself 99/100, isitagentready Level 4 by our computation and by Cloudflare's own scanner, and 1.0 on the Lighthouse Agentic view.
 
 ## Compared with isitagentready.com
 
@@ -25,6 +25,30 @@ It is built on the book **"The Agent-Ready Web"** by Maxim Salnikov and its demo
 Where we score differently from Cloudflare, every report says so (for example: Markdown without `Vary: Accept` is a warning here; commerce and OAuth checks only count when a site has a shop or an API).
 
 > **Comparison on real sites:** _(the lead fills this in: the table from milestone 2)_
+
+
+### Measured agreement (3 November 2026)
+
+Both scanners ran on the same 12 sites from the same machine: Cloudflare's through its public API (`POST https://isitagentready.com/api/scan`), ours with browser checks on. Script: `scripts/compare-iia.mjs`; raw results in [docs/comparison/](docs/comparison/).
+
+| Site | Cloudflare level | Our compat level | isitagentready checks agreeing | Agent-Ready score (ours, 0-100) | Lighthouse Agentic view (ours) |
+|---|---|---|---|---|---|
+| isitagentready.com | 4 | 4 | 23/23 | 76 | 0.67 |
+| developers.cloudflare.com | 4 | 4 | 23/23 | 87 | 1 |
+| docs.stripe.com | 4 | 4 | 23/23 | 70 | 0.33 |
+| supabase.com | 4 | 4 | 23/23 | 79 | 0.75 |
+| modelcontextprotocol.io | 4 | 4 | 23/23 | 84 | 0.67 |
+| www.allbirds.com | 1 | 1 | 23/23 | 69 | 0.67 |
+| github.com | 1 | 1 | 23/23 | 65 | 0.75 |
+| developer.mozilla.org | 1 | 1 | 23/23 | 76 | 1 |
+| en.wikipedia.org | 0 | 0 | 23/23 | 64 | 0.5 |
+| salnikov.no | 1 | 1 | 23/23 | 80 | 1 |
+| vercel.com | 1 | 1 | 23/23 | 83 | 0.5 |
+| www.bbc.com | 1 | 1 | 23/23 | 73 | 1 |
+
+The Level matches on 12 of 12 sites and 276 of 276 individual check results match. The first run disagreed on 8 results; three of our compat rules were aligned with what the live scanner does (a robots.txt `Sitemap` line must lead to a sitemap; ARD entries need `displayName`; an `Offer` on software is not a shop), and one difference was Cloudflare rate-limiting its own WebMCP check.
+
+Where we deliberately differ (shown in every report under "Where we differ from isitagentready"): our 0-100 score weighs all 13 layers by severity and standard maturity, so a clean site with no protocols can outscore a Level 4 site with weak HTML or JSON-LD; the Level only counts protocol files. Our DNS-AID check also detects wildcard DNS, which can make `_agents` records appear where none were published.
 
 ## Scoring
 
@@ -64,6 +88,8 @@ Stateless Streamable HTTP at `/mcp` (protocol 2026-07-28 with `server/discover`;
 The home page registers `scan_site` with `document.modelContext.registerTool()` and declares the scan form as a tool, so an agent in the browser can scan without clicking.
 
 ### CLI
+
+Not on npm yet (the name `agent-ready-check` is free there as of 3 November 2026). Until it is published, run it straight from GitHub: `npx github:vibeprogrammer/agent-ready-check https://example.com`. After `npm publish` the commands below work as written.
 
 ```bash
 npx agent-ready-check https://example.com                 # table
@@ -108,7 +134,8 @@ Every hop goes through an SSRF guard: http/https only, ports 80/443, DNS resolve
 - **Node 22+**: `npm ci && npm start` (port 8080; `BROWSER=1` for browser checks, `REPORTS_DIR=./reports` to keep reports).
 - **Docker**: `docker build -t agent-ready-check . && docker run -p 8080:8080 agent-ready-check` (Playwright base image, browser checks on).
 - **Azure Container Apps**, scale to zero: `./infra/deploy.sh` or `pwsh ./infra/deploy.ps1`. See [DEPLOY.md](DEPLOY.md) for options, the custom domain and the measured prices.
-- **Cloudflare Worker + D1** (no browser): `npm run build:worker`, then publish `dist/worker/`.
+- **Cloudflare Worker + D1**: `npm run build:worker`, then publish `dist/worker/`. Without a browser runner, browser checks show as "skipped". With one, set `BROWSER_RUNNER_URL` (comma-separated list allowed) and `RUNNER_TOKEN` at build time or as Worker variables.
+- **Browser runner** (for the Worker): `RUNNER_TOKEN=... bash scripts/runner-start.sh` on any small Linux box; it installs Node 24 if needed, the dependencies and Chromium's headless shell, then serves `POST /collect` behind a bearer token, one browser job at a time. On a 0.5 GB machine it needs swap and `vm.overcommit_memory=1` (the script sets both when it may).
 
 ## Development
 
