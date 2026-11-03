@@ -5,18 +5,41 @@
   "type": "module",
   "license": "MIT",
   "author": "Maxim Salnikov",
-  "repository": { "type": "git", "url": "git+https://github.com/vibeprogrammer/agent-ready-check.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vibeprogrammer/agent-ready-check.git"
+  },
   "homepage": "https://github.com/vibeprogrammer/agent-ready-check#readme",
-  "keywords": ["agent-ready", "ai-agents", "mcp", "webmcp", "llms.txt", "robots.txt", "isitagentready", "lighthouse", "accessibility"],
-  "engines": { "node": ">=22" },
-  "bin": { "agent-ready-check": "bin/agent-ready-check.mjs" },
+  "keywords": [
+    "agent-ready",
+    "ai-agents",
+    "mcp",
+    "webmcp",
+    "llms.txt",
+    "robots.txt",
+    "isitagentready",
+    "lighthouse",
+    "accessibility"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "agent-ready-check": "bin/agent-ready-check.mjs"
+  },
   "exports": {
     ".": "./src/index.mjs",
     "./core": "./src/core/scan.mjs",
     "./browser": "./src/browser/collect.mjs",
     "./catalog": "./src/catalog.json"
   },
-  "files": ["bin", "src", "public", "README.md", "LICENSE"],
+  "files": [
+    "bin",
+    "src",
+    "public",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server/node.mjs",
     "lint": "eslint .",
@@ -33,10 +56,10 @@
   },
   "optionalDependencies": {
     "axe-core": "^4.10.0",
-    "playwright-core": "^1.50.0"
+    "playwright-core": "1.64.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.50.0",
+    "@playwright/test": "1.64.1",
     "esbuild": "^0.25.0",
     "eslint": "^9.20.0",
     "@eslint/js": "^9.20.0",

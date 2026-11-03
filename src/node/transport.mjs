@@ -25,13 +25,17 @@ export function transport({ method, url, headers, body, timeoutMs, maxBytes, add
       rejectUnauthorized: true,
     }, (res) => {
       ttfb = Date.now() - t0;
+      const noBody = method === 'HEAD' || res.statusCode === 204 || res.statusCode === 304;
       let stream = res;
       const enc = String(res.headers['content-encoding'] || '').toLowerCase();
-      try {
-        if (enc === 'gzip' || enc === 'x-gzip') stream = res.pipe(zlib.createGunzip());
-        else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
-        else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
-      } catch { stream = res; }
+      if (!noBody) {
+        try {
+          if (enc === 'gzip' || enc === 'x-gzip') stream = res.pipe(zlib.createGunzip());
+          else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
+          else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
+        } catch { stream = res; }
+      }
+      if (stream !== res) res.on('error', () => {});
       const chunks = []; let size = 0; let truncated = false; let done = false;
       const finish = () => {
         if (done) return; done = true;
@@ -42,7 +46,7 @@ export function transport({ method, url, headers, body, timeoutMs, maxBytes, add
         }
         resolveP({ status: res.statusCode, headers: hdrs, body: new Uint8Array(Buffer.concat(chunks)), truncated, ttfb });
       };
-      if (method === 'HEAD' || res.statusCode === 204 || res.statusCode === 304) { res.resume(); res.on('end', finish); return; }
+      if (noBody) { res.resume(); res.on('end', finish); res.on('error', finish); return; }
       stream.on('data', (c) => {
         if (size + c.length > maxBytes) { chunks.push(c.subarray(0, maxBytes - size)); size = maxBytes; truncated = true; req.destroy(); finish(); return; }
         chunks.push(c); size += c.length;

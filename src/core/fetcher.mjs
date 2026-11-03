@@ -141,6 +141,7 @@ export class SafeFetcher {
         ex.bytes = res.body?.byteLength || 0;
         ex.truncated = !!res.truncated;
         ex.text = res.body ? TEXT_DECODER.decode(res.body) : '';
+        Object.defineProperty(ex, 'raw', { value: res.body || new Uint8Array(0), enumerable: false });
         break;
       }
     } catch (e) {

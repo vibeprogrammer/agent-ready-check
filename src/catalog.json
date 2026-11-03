@@ -482,9 +482,9 @@
   "gpc": {
    "name": "Global Privacy Control",
    "body": "W3C Privacy WG",
-   "version": "Working Draft",
-   "date": "2026",
-   "status": "W3C WG draft (legally recognised in some US states)",
+   "version": "Working Draft 24 September 2026",
+   "date": "2026-09-24",
+   "status": "W3C Working Draft",
    "maturity": "draft",
    "url": "https://www.w3.org/TR/gpc/"
   },
@@ -1381,7 +1381,7 @@
    "iia": "apiCatalog",
    "lh": null,
    "requires": "http",
-   "applies": "always",
+   "applies": "api",
    "heuristic": false
   },
   {
@@ -1516,7 +1516,7 @@
    "iia": "mcpServerCard",
    "lh": null,
    "requires": "http",
-   "applies": "always",
+   "applies": "mcp",
    "heuristic": false
   },
   {
@@ -1526,7 +1526,7 @@
    "severity": 2,
    "standard": "mcpcard",
    "chapter": 11,
-   "test": "serverInfo name+version, transport/remotes url, capabilities; SEP-2127 location also checked",
+   "test": "serverInfo name+version, transport/remotes URL that answers, SEP-2127 location (/mcp/server-card) also checked",
    "roles": "arch,dev",
    "iia": null,
    "lh": null,
@@ -1621,7 +1621,7 @@
    "iia": "webMcp",
    "lh": "webmcp-registered-tools",
    "requires": "http",
-   "applies": "always",
+   "applies": "forms",
    "heuristic": false
   },
   {
@@ -1696,7 +1696,7 @@
    "iia": null,
    "lh": null,
    "requires": "http",
-   "applies": "always",
+   "applies": "forms",
    "heuristic": true
   },
   {
@@ -1751,7 +1751,7 @@
    "severity": 2,
    "standard": "ard",
    "chapter": 11,
-   "test": "specVersion, host, entries with urn:air identifier, displayName, IANA media type, exactly one of url/data; warns on legacy location",
+   "test": "specVersion, entries with urn:air identifier, displayName, IANA media type, exactly one of url/data; host object noted (only Cloudflare's fix text asks for it); warns on legacy location",
    "roles": "arch,dev",
    "iia": null,
    "lh": null,
@@ -2306,7 +2306,7 @@
    "severity": 1,
    "standard": "book",
    "chapter": 3,
-   "test": "Server HTML bytes and DOM node count reported; informational, warns only past Googlebot's documented 15 MB HTML fetch limit",
+   "test": "Server HTML bytes and DOM node count reported; warns above 2 MB, the part of a file Googlebot crawls for Google Search (Google's Googlebot page, read 2026-11-03; 15 MB is the general fetch limit)",
    "roles": "dev",
    "iia": null,
    "lh": null,

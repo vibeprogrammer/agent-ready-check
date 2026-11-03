@@ -10,7 +10,8 @@ const isHiddenStyle = (s) => /display\s*:\s*none|visibility\s*:\s*hidden/i.test(
 
 /** Visible text of a server-rendered document (ignores script/style/template, [hidden], inline display:none). */
 export function visibleText(doc) {
-  if (!doc?.body) return '';
+  const root = doc?.body || doc?.documentElement;
+  if (!root) return '';
   const parts = [];
   const walk = (node) => {
     for (const n of node.childNodes || []) {
@@ -23,7 +24,7 @@ export function visibleText(doc) {
       walk(n);
     }
   };
-  walk(doc.body);
+  walk(root);
   return parts.join(' ').replace(/\s+/g, ' ').trim();
 }
 

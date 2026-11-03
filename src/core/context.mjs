@@ -1,6 +1,6 @@
 // ScanContext: the shared, lazily computed view of one site. Checks ask it for artifacts;
 // each artifact is fetched/parsed once per scan (memoised promises).
-import { SafeFetcher } from './fetcher.mjs';
+/** @typedef {import('./fetcher.mjs').SafeFetcher} SafeFetcher */
 import { parseDocument, visibleText } from './html.mjs';
 import { parseRobots, isAllowed } from './parse/robots.mjs';
 import { parseLinkHeader } from './parse/link-header.mjs';

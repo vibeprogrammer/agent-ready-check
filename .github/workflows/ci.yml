@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  fixtures:
+    # Graded regression: the Nordlys Cabins demo from the book at several --upto layers, with known scores.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Clone the book demos (v1.0.0)
+        run: git clone --depth 1 --branch v1.0.0 https://github.com/webmaxru/agent-ready-web-demos ../demos
+      - name: Install the demos
+        working-directory: ../demos
+        run: npm ci
+      - run: npm run test:fixtures
+        env:
+          DEMOS_DIR: ../demos
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: test-results/
+          retention-days: 7
+
+  worker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:worker
+      - name: Smoke-test the bundle in Node (no bindings)
+        run: |
+          node --input-type=module -e "
+            const w = (await import('./dist/worker/_worker.mjs')).default;
+            for (const p of ['/', '/robots.txt', '/.well-known/api-catalog', '/api/checks']) {
+              const r = await w.fetch(new Request('https://ci.example' + p), {}, {});
+              if (r.status !== 200) { console.error(p, r.status); process.exit(1); }
+              console.log(p, r.status, r.headers.get('content-type'));
+            }"
