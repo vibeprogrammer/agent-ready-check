@@ -1,6 +1,6 @@
 {
   "name": "agent-ready-check",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Check how agent-ready a website is: 113 checks across 13 layers from The Agent-Ready Web, with evidence, fixes, an isitagentready-compatible level and a Lighthouse Agentic view. JSON API, MCP server, WebMCP, CLI.",
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,6 @@
     "bin",
     "src",
     "server",
-    "public",
     "README.md",
     "LICENSE"
   ],
@@ -48,7 +47,8 @@
     "test:fixtures": "node --test \"test/fixtures/**/*.test.mjs\"",
     "test:e2e": "playwright test",
     "build:worker": "node scripts/build-worker.mjs",
-    "scan": "node bin/agent-ready-check.mjs"
+    "scan": "node bin/agent-ready-check.mjs",
+    "build:azure": "node scripts/build-azure.mjs"
   },
   "dependencies": {
     "hono": "^4.10.0",
@@ -65,5 +65,12 @@
     "eslint": "^9.20.0",
     "@eslint/js": "^9.20.0",
     "globals": "^15.0.0"
+  },
+  "bugs": {
+    "url": "https://github.com/vibeprogrammer/agent-ready-check/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

@@ -1,211 +1,270 @@
-// Azure infrastructure for Agent-Ready Check (https://github.com/vibeprogrammer/agent-ready-check).
+// Agent-Ready Check on Azure: Static Web Apps (site + managed Azure Functions API), Blob Storage for reports,
+// and an optional browser runner on Container Apps (scales to zero).
 //
-//   - Azure Container Apps, consumption plan, scale to zero (min 0, max 2 replicas). The container is built from
-//     the official Playwright image, so the browser checks (accessibility tree, axe, WebMCP, CLS) run too.
-//   - Azure Container Registry, Basic: the image is built in the cloud with `az acr build` (no local Docker).
-//     The app pulls it with a user-assigned managed identity (AcrPull), so no registry password exists anywhere.
-//   - Storage account + Azure Files share mounted at /data: stored reports (kept 30 days) survive restarts and
-//     scale-to-zero.
-//   - Log Analytics with 30-day retention and a daily ingestion cap, for container logs.
-//
-// No secrets in this file: the storage key and the Log Analytics key are read with listKeys() at deployment time
-// and go straight into the environment's configuration.
-// Deployed by infra/deploy.sh or infra/deploy.ps1. Costs: DEPLOY.md.
+//   az deployment group create -g <rg> -f infra/main.bicep -p customDomain=agent.isainative.dev ...
+// infra/deploy.sh and infra/deploy.ps1 wrap this (plus the one-time GitHub OIDC setup); docs/PUBLISHING.md has
+// the click-by-click version and the costs.
+targetScope = 'resourceGroup'
 
-@description('Azure region for every resource.')
-param location string = resourceGroup().location
-
-@description('Base name for the resources (lowercase letters, digits and hyphens).')
+@description('Name prefix for the resources.')
 @minLength(3)
-@maxLength(20)
+@maxLength(24)
 param appName string = 'agent-ready-check'
 
-@description('Container image. Empty on the first deployment: a public placeholder runs until deploy.sh pushes the real image.')
-param image string = ''
+@description('Region for the storage account and the browser runner.')
+param location string = resourceGroup().location
 
-@description('Public origin of the service, for absolute links in llms.txt, the OpenAPI servers list and the MCP card. Empty: taken from each request.')
+@description('Region of the Static Web App resource. The site itself is served from the global edge; this only places the managed functions and the metadata.')
+@allowed([
+  'westeurope'
+  'eastus2'
+  'centralus'
+  'westus2'
+  'eastasia'
+])
+param swaLocation string = 'westeurope'
+
+@description('Free is enough: managed functions, 2 custom domains, 100 GB bandwidth. Standard (about 9 USD per app per month) is only needed for a linked Function App, private endpoints or the SLA.')
+@allowed([
+  'Free'
+  'Standard'
+])
+param swaSku string = 'Free'
+
+@description('Custom domain, for example agent.isainative.dev. Bind it only after its CNAME points at the default host name (the deploy scripts check that first).')
+param customDomain string = ''
+
+@description('Public origin used in links, robots.txt, llms.txt, the API catalog and the MCP card. Empty means the custom domain when set, else the default host name.')
 param baseUrl string = ''
 
-@description('Scans per client per window.')
+@description('Deploy the browser runner (axe rules, accessibility tree, WebMCP, CLS run in Chromium there).')
+param deployBrowserRunner bool = true
+
+@description('Browser runner image, for example ghcr.io/<owner>/agent-ready-check-runner:latest (public package, built by the deploy workflow).')
+param runnerImage string = ''
+
+@description('Bearer token shared by the function and the runner. A new random value on every deployment unless given.')
+@secure()
+param runnerToken string = newGuid()
+
+@description('vCPU for the runner (Container Apps consumption pairs 1.0 with 2Gi).')
+param runnerCpu string = '1.0'
+
+@description('Memory for the runner.')
+param runnerMemory string = '2Gi'
+
+@description('Seconds the runner stays up after its last request before it scales to zero.')
+@minValue(0)
+param runnerCooldownSeconds int = 120
+
+@description('Scans per client per window (per function instance).')
 param rateLimit int = 10
 
 @description('Rate-limit window in seconds.')
 param rateWindowSeconds int = 600
 
-@description('Maximum replicas (each one is 1 vCPU / 2 GiB while active).')
-@minValue(1)
-@maxValue(10)
-param maxReplicas int = 2
+@description('Object id of the GitHub Actions service principal (Entra app). When set, it gets Contributor on this resource group so the workflows can deploy. Needs Owner or User Access Administrator to assign.')
+param deployerPrincipalId string = ''
 
-@description('Log Analytics daily ingestion cap in GB (stops runaway log costs).')
-param logDailyCapGb string = '0.5'
-
-var suffix = uniqueString(resourceGroup().id)
-var acrName = take('acr${replace(appName, '-', '')}${suffix}', 50)
-var storageName = take('st${replace(appName, '-', '')}${suffix}', 24)
-var shareName = 'reports'
-var placeholderImage = 'mcr.microsoft.com/k8se/quickstart:latest'
-var useRealImage = !empty(image)
-var acrPullRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
-var tags = { app: appName, source: 'https://github.com/vibeprogrammer/agent-ready-check' }
-
-resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
-  name: 'log-${appName}'
-  location: location
-  tags: tags
-  properties: {
-    sku: { name: 'PerGB2018' }
-    retentionInDays: 30
-    workspaceCapping: { dailyQuotaGb: json(logDailyCapGb) }
-  }
-}
-
-resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
-  name: acrName
-  location: location
-  tags: tags
-  sku: { name: 'Basic' }
-  properties: {
-    adminUserEnabled: false
-  }
-}
-
-resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: 'id-${appName}'
-  location: location
-  tags: tags
-}
-
-resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(acr.id, identity.id, acrPullRoleId)
-  scope: acr
-  properties: {
-    roleDefinitionId: acrPullRoleId
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
+var suffix = uniqueString(resourceGroup().id, appName)
+var storageName = toLower('arc${take(suffix, 13)}')
+var runnerOn = deployBrowserRunner && !empty(runnerImage)
+var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
   location: location
-  tags: tags
-  sku: { name: 'Standard_LRS' }
   kind: 'StorageV2'
+  sku: {
+    name: 'Standard_LRS'
+  }
   properties: {
     accessTier: 'Hot'
     minimumTlsVersion: 'TLS1_2'
-    allowBlobPublicAccess: false
     supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: true
   }
 }
 
-resource fileService 'Microsoft.Storage/storageAccounts/fileServices@2023-05-01' = {
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
 }
 
-resource share 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = {
-  parent: fileService
-  name: shareName
+resource reportsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'reports'
   properties: {
-    accessTier: 'Hot'
-    shareQuota: 5
+    publicAccess: 'None'
   }
 }
 
-resource env 'Microsoft.App/managedEnvironments@2024-03-01' = {
-  name: 'cae-${appName}'
-  location: location
-  tags: tags
+// Reports are kept 30 days: the lifecycle rule deletes blobs 30 days after their last write (no cleanup job).
+resource lifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
+  parent: storage
+  name: 'default'
   properties: {
-    appLogsConfiguration: {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: logs.properties.customerId
-        sharedKey: logs.listKeys().primarySharedKey
-      }
+    policy: {
+      rules: [
+        {
+          name: 'expire-reports'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                'reports/'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: 30
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }
 
-resource envStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01' = {
-  parent: env
-  name: shareName
-  properties: {
-    azureFile: {
-      accountName: storage.name
-      accountKey: storage.listKeys().keys[0].value
-      shareName: shareName
-      accessMode: 'ReadWrite'
-    }
-  }
-  dependsOn: [ share ]
-}
-
-resource app 'Microsoft.App/containerApps@2024-03-01' = {
+resource swa 'Microsoft.Web/staticSites@2024-04-01' = {
   name: appName
-  location: location
-  tags: tags
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: { '${identity.id}': {} }
+  location: swaLocation
+  sku: {
+    name: swaSku
+    tier: swaSku
   }
   properties: {
-    managedEnvironmentId: env.id
+    allowConfigFileUpdates: true
+    stagingEnvironmentPolicy: 'Enabled'
+  }
+}
+
+resource caEnv 'Microsoft.App/managedEnvironments@2025-01-01' = if (runnerOn) {
+  name: '${appName}-env'
+  location: location
+  properties: {
+    zoneRedundant: false
+  }
+}
+
+resource runner 'Microsoft.App/containerApps@2025-01-01' = if (runnerOn) {
+  name: '${take(appName, 25)}-runner'
+  location: location
+  properties: {
+    managedEnvironmentId: caEnv.id
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: useRealImage ? 8080 : 80
+        targetPort: 8080
         transport: 'auto'
         allowInsecure: false
       }
-      registries: [
-        { server: acr.properties.loginServer, identity: identity.id }
+      secrets: [
+        {
+          name: 'runner-token'
+          value: runnerToken
+        }
       ]
     }
     template: {
       containers: [
         {
-          name: appName
-          image: useRealImage ? image : placeholderImage
-          resources: { cpu: json('1.0'), memory: '2Gi' }
+          name: 'runner'
+          image: runnerImage
+          resources: {
+            cpu: json(runnerCpu)
+            memory: runnerMemory
+          }
           env: [
-            { name: 'PORT', value: '8080' }
-            { name: 'REPORTS_DIR', value: '/data' }
-            { name: 'BROWSER', value: '1' }
-            { name: 'TRUST_PROXY', value: '1' }
-            { name: 'RATE_LIMIT', value: string(rateLimit) }
-            { name: 'RATE_WINDOW', value: string(rateWindowSeconds) }
-            { name: 'BASE_URL', value: baseUrl }
+            {
+              name: 'RUNNER_TOKEN'
+              secretRef: 'runner-token'
+            }
+            {
+              name: 'RUNNER_JOB_TIMEOUT_MS'
+              value: '30000'
+            }
+            {
+              // Changes whenever the token changes, so the app gets a new revision and running replicas never keep
+              // an old token (a secret update alone does not restart them). Not the token itself.
+              name: 'RUNNER_TOKEN_VERSION'
+              value: uniqueString(runnerToken)
+            }
           ]
-          volumeMounts: [ { volumeName: 'reports', mountPath: '/data' } ]
-          probes: useRealImage ? [
-            { type: 'Liveness', httpGet: { path: '/api/health', port: 8080 }, initialDelaySeconds: 5, periodSeconds: 30 }
-            { type: 'Readiness', httpGet: { path: '/api/health', port: 8080 }, initialDelaySeconds: 2, periodSeconds: 10 }
-          ] : []
         }
       ]
       scale: {
         minReplicas: 0
-        maxReplicas: maxReplicas
+        maxReplicas: 1
+        cooldownPeriod: runnerCooldownSeconds
         rules: [
-          { name: 'http', http: { metadata: { concurrentRequests: '10' } } }
+          {
+            name: 'http'
+            http: {
+              metadata: {
+                concurrentRequests: '2'
+              }
+            }
+          }
         ]
       }
-      volumes: [
-        { name: 'reports', storageType: 'AzureFile', storageName: envStorage.name }
-      ]
     }
   }
-  dependsOn: [ acrPull ]
 }
 
-output appName string = app.name
-output fqdn string = app.properties.configuration.ingress.fqdn
-output url string = 'https://${app.properties.configuration.ingress.fqdn}'
-output acrName string = acr.name
-output acrLoginServer string = acr.properties.loginServer
-output environmentName string = env.name
-output customDomainVerificationId string = env.properties.customDomainConfiguration.customDomainVerificationId
+var publicOrigin = !empty(baseUrl) ? baseUrl : (!empty(customDomain) ? 'https://${customDomain}' : 'https://${swa.properties.defaultHostname}')
+var runnerUrl = runnerOn ? 'https://${runner!.properties.configuration.ingress.fqdn}/collect' : ''
+
+resource appSettings 'Microsoft.Web/staticSites/config@2024-04-01' = {
+  parent: swa
+  name: 'appsettings'
+  properties: {
+    BASE_URL: publicOrigin
+    REPORTS_CONNECTION_STRING: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+    REPORTS_CONTAINER: reportsContainer.name
+    BROWSER_RUNNER_URL: runnerUrl
+    RUNNER_TOKEN: runnerOn ? runnerToken : ''
+    RATE_LIMIT: string(rateLimit)
+    RATE_WINDOW: string(rateWindowSeconds)
+    SCAN_TIMEOUT_MS: '30000'
+  }
+}
+
+// Bind the custom domain. Static Web Apps validates a subdomain by its CNAME to the default host name, so the
+// DNS record must exist before this runs.
+resource domain 'Microsoft.Web/staticSites/customDomains@2024-04-01' = if (!empty(customDomain)) {
+  parent: swa
+  name: empty(customDomain) ? 'unused.invalid' : customDomain
+  properties: {
+    validationMethod: 'cname-delegation'
+  }
+  dependsOn: [
+    appSettings
+  ]
+}
+
+resource deployerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(deployerPrincipalId)) {
+  name: guid(resourceGroup().id, deployerPrincipalId, contributorRoleId)
+  properties: {
+    principalId: deployerPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+  }
+}
+
+output staticWebAppName string = swa.name
+output defaultHostname string = swa.properties.defaultHostname
+output publicOrigin string = publicOrigin
+output storageAccountName string = storage.name
+output runnerAppName string = runnerOn ? runner.name : ''
+output runnerFqdn string = runnerOn ? runner!.properties.configuration.ingress.fqdn : ''
+output dnsRecord string = empty(customDomain) ? '' : 'CNAME ${customDomain} -> ${swa.properties.defaultHostname}'

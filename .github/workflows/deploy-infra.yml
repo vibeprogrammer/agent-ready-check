@@ -1,0 +1,58 @@
+# Re-apply infra/main.bicep from GitHub (for example to bind the custom domain once its CNAME is live, or to change
+# the plan), without running anything locally. Same OIDC sign-in as the deploy workflow.
+# The one-time first run (which also creates the GitHub sign-in itself) is infra/deploy.sh in Azure Cloud Shell.
+name: Deploy infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_domain:
+        description: Custom domain to bind (its CNAME must already point at the Static Web App)
+        required: false
+        default: agent.isainative.dev
+      swa_sku:
+        description: Static Web Apps plan
+        type: choice
+        options: [Free, Standard]
+        default: Free
+      browser_runner:
+        description: Deploy the browser runner (Container App)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-azure
+  cancel-in-progress: false
+
+jobs:
+  bicep:
+    if: vars.AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Check DNS before binding the domain
+        if: inputs.custom_domain != ''
+        run: |
+          host="$(az staticwebapp show -n "${{ vars.AZURE_STATIC_WEB_APP }}" -g "${{ vars.AZURE_RESOURCE_GROUP }}" --query defaultHostname -o tsv)"
+          cname="$(dig +short CNAME "${{ inputs.custom_domain }}" | sed 's/\.$//')"
+          echo "CNAME ${{ inputs.custom_domain }} -> ${cname:-missing} (expected $host)" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$cname" = "$host" ] || { echo "::error::Add the CNAME record first (docs/PUBLISHING.md, DNS)"; exit 1; }
+      - name: Deploy infra/main.bicep
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agent-ready-check-runner:latest"
+          az deployment group create -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "gh-${{ github.run_id }}" -f infra/main.bicep \
+            -p appName="${{ vars.AZURE_STATIC_WEB_APP }}" swaSku="${{ inputs.swa_sku }}" customDomain="${{ inputs.custom_domain }}" \
+               deployBrowserRunner=${{ inputs.browser_runner }} runnerImage="$image" \
+            --query properties.outputs -o json | tee outputs.json
+          origin="$(python3 -c "import json;print(json.load(open('outputs.json'))['publicOrigin']['value'])")"
+          echo "Public origin: $origin. If it changed, set the PUBLIC_BASE_URL variable to it and re-run Deploy to Azure." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,41 @@
+# Publish to npm when a GitHub release is published, with npm Trusted Publishing (OIDC): no NPM_TOKEN anywhere.
+# npm signs the package with a provenance statement that links it to this workflow run.
+#
+# Gate: the job runs only when the repository variable NPM_TRUSTED_PUBLISHING is "true". Set it after the
+# trusted publisher is configured on npmjs.com (docs/PUBLISHING.md). Without it a release only skips this job,
+# so cutting a release can never fail or publish by accident before the setup is done.
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: vars.NPM_TRUSTED_PUBLISHING == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: npm 11.5.1 or later (needed for trusted publishing)
+        run: npm install -g npm@11 && npm --version
+      - run: npm ci
+      - run: npm test
+      - name: The release tag must match package.json
+        if: github.event_name == 'release'
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          [ "${GITHUB_REF_NAME#v}" = "$v" ] || { echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version $v"; exit 1; }
+      - name: Point repository.url at this repository (provenance requires a match)
+        run: npm pkg set repository.url="git+https://github.com/${GITHUB_REPOSITORY}.git"
+      - run: npm publish --provenance --access public

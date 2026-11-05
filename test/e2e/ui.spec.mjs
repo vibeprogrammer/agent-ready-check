@@ -42,7 +42,7 @@ test.beforeAll(async () => {
   ui = http.createServer((q, s) => {
     const u = new URL(q.url, 'http://x');
     const send = (type, body, code = 200) => { s.writeHead(code, { 'content-type': type, 'content-security-policy': "default-src 'self'; img-src 'self' data:" }); s.end(body); };
-    if (ASSETS[u.pathname]) return send(ASSETS[u.pathname].type, ASSETS[u.pathname].body);
+    if (ASSETS[u.pathname]) { const a = ASSETS[u.pathname]; return send(a.type, a.encoding === 'base64' ? Buffer.from(a.body, 'base64') : a.body); }
     if (u.pathname === '/') return send('text/html', renderHomeHtml({ baseUrl: ui.base }));
     if (u.pathname === '/r/e2e1') return send('text/html', renderReportHtml(report, { baseUrl: ui.base, reportId: 'e2e1' }));
     if (u.pathname.startsWith('/badge/')) return send('image/svg+xml', renderBadge({ score: report.score, level: report.compat.isitagentready.level }));

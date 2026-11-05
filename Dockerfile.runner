@@ -1,0 +1,29 @@
+# Browser runner image: server/runner.mjs + playwright-core + Chromium's headless shell, nothing else.
+# Used by the Azure deployment (infra/main.bicep, an optional Container App that scales to zero) and by any host that
+# runs the browser checks for a deployment that cannot start a browser itself (Static Web Apps functions, Workers).
+# Built and pushed to GitHub Container Registry by .github/workflows/deploy-azure.yml; CI builds and smoke-tests it.
+#   docker build -f Dockerfile.runner -t agent-ready-check-runner .
+#   docker run -p 8080:8080 -e RUNNER_TOKEN=... agent-ready-check-runner
+FROM node:24-bookworm-slim
+
+ENV NODE_ENV=production \
+    PORT=8080 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_CHROMIUM_HEADLESS_SHELL=1
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+# playwright-core and axe-core are optional dependencies, so --omit=dev keeps them. The headless shell is the
+# Chromium build that matches playwright-core's version; --with-deps adds the system libraries it needs.
+RUN npm ci --omit=dev --no-audit --no-fund \
+ && npx --no-install playwright-core install --with-deps --only-shell chromium \
+ && npm cache clean --force \
+ && rm -rf /var/lib/apt/lists/* /root/.cache
+
+COPY src ./src
+COPY server/runner.mjs ./server/runner.mjs
+
+USER node
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server/runner.mjs"]

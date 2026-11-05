@@ -1,0 +1,131 @@
+# Deploy to Azure Static Web Apps on every push to main (and on demand).
+# Sign-in is OIDC (azure/login with a federated credential): no Azure secret is stored in this repository.
+# The Static Web Apps deployment token is read at run time with that sign-in and masked; it is never stored.
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables), written by infra/deploy.sh / .ps1:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_STATIC_WEB_APP,
+#   AZURE_RUNNER_APP (empty or unset: no browser runner), PUBLIC_BASE_URL.
+# Until AZURE_CLIENT_ID is set the jobs are skipped, so pushes to main stay green before the one-time setup.
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-azure
+  cancel-in-progress: false
+
+env:
+  RUNNER_IMAGE_NAME: agent-ready-check-runner
+
+jobs:
+  runner-image:
+    name: Browser runner image
+    if: vars.AZURE_CLIENT_ID != '' && vars.AZURE_RUNNER_APP != ''
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Image name
+        id: img
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${RUNNER_IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runner
+          push: true
+          tags: |
+            ${{ steps.img.outputs.ref }}:${{ github.sha }}
+            ${{ steps.img.outputs.ref }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Agent-Ready Check browser runner
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Roll out the image
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          az containerapp update -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AZURE_RUNNER_APP }}" \
+            --image "${{ steps.img.outputs.ref }}:${{ github.sha }}" --output none
+          echo "Runner image: ${{ steps.img.outputs.ref }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+  site:
+    name: Static Web App and API
+    # Runs even when the runner job failed or was skipped: the site does not depend on the runner image.
+    if: always() && vars.AZURE_CLIENT_ID != ''
+    needs: runner-image
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PUBLIC_BASE_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Build the site and the function bundle
+        run: npm run build:azure -- --base-url "${{ vars.PUBLIC_BASE_URL }}"
+      - name: Install the function's runtime dependency
+        run: npm ci --prefix api --omit=dev --no-audit --no-fund
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Read the deployment token (masked, not stored)
+        id: swa
+        run: |
+          token="$(az staticwebapp secrets list -n "${{ vars.AZURE_STATIC_WEB_APP }}" -g "${{ vars.AZURE_RESOURCE_GROUP }}" --query properties.apiKey -o tsv)"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa.outputs.token }}
+          action: upload
+          app_location: dist/azure/web
+          api_location: api
+          output_location: ''
+          skip_app_build: true
+          skip_api_build: true
+      - name: Smoke test the live site
+        env:
+          BASE: ${{ vars.PUBLIC_BASE_URL }}
+          EXPECT_BROWSER: ${{ vars.AZURE_RUNNER_APP != '' && '1' || '' }}
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS "$BASE/api/health"; then break; fi
+            sleep 20
+          done
+          python3 infra/check_site.py "$BASE"
+      - name: Self-scan
+        continue-on-error: true
+        run: |
+          node bin/agent-ready-check.mjs "${{ vars.PUBLIC_BASE_URL }}" --json > self-scan.json || true
+          node -e "const r=JSON.parse(require('fs').readFileSync('self-scan.json','utf8'));console.log('Self-scan: score '+r.score+', isitagentready level '+r.compat?.isitagentready?.level)" | tee -a "$GITHUB_STEP_SUMMARY"

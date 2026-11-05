@@ -39,7 +39,7 @@ export function page({ base, path, title, description, body, mdPath, noindex = f
 <title>${esc(full)}</title>
 <meta name="description" content="${esc(description)}">
 ${noindex ? '<meta name="robots" content="noindex">\n' : ''}<link rel="canonical" href="${esc(base + path)}">
-${mdPath ? `<link rel="alternate" type="text/markdown" href="${esc(mdPath)}">\n` : ''}<link rel="stylesheet" href="/assets/pages.css">
+${mdPath ? `<link rel="alternate" type="text/markdown" href="${esc(mdPath)}">\n` : ''}<link rel="stylesheet" href="/assets/app.css">
 <meta property="og:title" content="${esc(full)}">
 <meta property="og:description" content="${esc(description)}">
 <meta property="og:type" content="website">

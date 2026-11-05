@@ -4,7 +4,7 @@ Check how ready a website is for AI agents. **113 checks in 13 layers**, from th
 
 It is built on the book **"The Agent-Ready Web"** by Maxim Salnikov and its demos ([webmaxru/agent-ready-web-demos](https://github.com/webmaxru/agent-ready-web-demos), MIT): every check cites the chapter that explains it and the standard behind it, with that standard's status (RFC, W3C Recommendation, draft, vendor proposal), so you do not over-invest in drafts.
 
-> **Live instance:** https://agent-ready-check.sites.tab.bot (deployed 3 November 2026; a Cloudflare Worker with D1 for reports, plus a small browser runner for the browser checks). It scores itself 100/100 (rounded; the one failing check is DNS-AID, which needs DNS records this host cannot publish), isitagentready Level 4 by our computation and by Cloudflare's own scanner, and 1.0 on the Lighthouse Agentic view.
+> **Live:** https://agent-ready-check.sites.tab.bot (a preview instance). The production home is moving to **https://agent.isainative.dev** on Azure Static Web Apps; see [DEPLOY.md](DEPLOY.md) and [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
 ## Compared with isitagentready.com
 
@@ -21,11 +21,6 @@ It is built on the book **"The Agent-Ready Web"** by Maxim Salnikov and its demo
 | Fix snippet and fix prompt per finding | fix text | yes, plus "copy all fix prompts" |
 | Standard status per finding, drafts weighted lower | no | yes |
 | Per-role view (developer, designer, content/SEO, PM, architect, QA, security, analytics) | no | yes |
-
-Where we score differently from Cloudflare, every report says so (for example: Markdown without `Vary: Accept` is a warning here; commerce and OAuth checks only count when a site has a shop or an API).
-
-> **Comparison on real sites:** _(the lead fills this in: the table from milestone 2)_
-
 
 ### Measured agreement (3 November 2026)
 
@@ -47,8 +42,6 @@ Both scanners ran on the same 12 sites from the same machine: Cloudflare's throu
 | www.bbc.com | 1 | 1 | 23/23 | 73 | 1 |
 
 The Level matches on 12 of 12 sites and 276 of 276 individual check results match. The first run disagreed on 8 results; three of our compat rules were aligned with what the live scanner does (a robots.txt `Sitemap` line must lead to a sitemap; ARD entries need `displayName`; an `Offer` on software is not a shop), and one difference was Cloudflare rate-limiting its own WebMCP check.
-
-Where we deliberately differ (shown in every report under "Where we differ from isitagentready"): our 0-100 score weighs all 13 layers by severity and standard maturity, so a clean site with no protocols can outscore a Level 4 site with weak HTML or JSON-LD; the Level only counts protocol files. Our DNS-AID check also detects wildcard DNS, which can make `_agents` records appear where none were published.
 
 ## Scoring
 
@@ -89,7 +82,7 @@ The home page registers `scan_site` with `document.modelContext.registerTool()` 
 
 ### CLI
 
-Not on npm yet (the name `agent-ready-check` is free there as of 3 November 2026). Until it is published, run it straight from GitHub: `npx github:vibeprogrammer/agent-ready-check https://example.com`. After `npm publish` the commands below work as written.
+Published to npm as [`agent-ready-check`](https://www.npmjs.com/package/agent-ready-check) from GitHub releases (trusted publishing with provenance; see [docs/PUBLISHING.md](docs/PUBLISHING.md)). Until the first version is on npm, run it from GitHub with `npx github:vibeprogrammer/agent-ready-check <url>`.
 
 ```bash
 npx agent-ready-check https://example.com                 # table
@@ -123,19 +116,19 @@ robots.txt with named AI crawler groups, `Content-Signal` and `Agentmap`; sitema
 
 It targets isitagentready **Level 4**. Level 5 would need Web Bot Auth or OAuth metadata, which an anonymous public scanner has no use for, so we do not fake them.
 
-> **Its own scores:** _(the lead fills this in)_
+Its own scores are recorded in each release's notes and in the deploy workflow's run summary (a self-scan runs after every deploy).
 
 ## Safe fetching
 
 Every hop goes through an SSRF guard: http/https only, ports 80/443, DNS resolved and every address checked against private, loopback, link-local, CGNAT, multicast, reserved and IPv6 ULA/mapped ranges; redirects followed by hand (max 5) with the guard on each hop; Node pins the connection to the checked address. Per request 10 s and a byte cap; per scan 120 requests, 8 at a time, 60 s. The user agent identifies itself (`AgentReadyCheck/<version>`), and crawl-type reads obey robots.txt for that token.
 
-## Self-hosting
+## Hosting
 
+- **Azure Static Web Apps + Azure Functions** (production): the site on the Free plan, the whole app as one managed function, reports in Blob Storage, an optional browser runner on Container Apps that scales to zero. About 0 USD a month at light use. One Cloud Shell run sets it up (`infra/deploy.sh` or `infra/deploy.ps1 -GitHubRepo <owner>/<repo> -CustomDomain <domain>`), then GitHub Actions deploys every push to `main` with OIDC. Architecture, decisions and costs: [DEPLOY.md](DEPLOY.md). Click-by-click setup: [docs/PUBLISHING.md](docs/PUBLISHING.md).
 - **Node 22+**: `npm ci && npm start` (port 8080; `BROWSER=1` for browser checks, `REPORTS_DIR=./reports` to keep reports).
 - **Docker**: `docker build -t agent-ready-check . && docker run -p 8080:8080 agent-ready-check` (Playwright base image, browser checks on).
-- **Azure Container Apps**, scale to zero: `./infra/deploy.sh` or `pwsh ./infra/deploy.ps1`. See [DEPLOY.md](DEPLOY.md) for options, the custom domain and the measured prices.
-- **Cloudflare Worker + D1**: `npm run build:worker`, then publish `dist/worker/`. Without a browser runner, browser checks show as "skipped". With one, set `BROWSER_RUNNER_URL` (comma-separated list allowed) and `RUNNER_TOKEN` at build time or as Worker variables.
-- **Browser runner** (for the Worker): `RUNNER_TOKEN=... bash scripts/runner-start.sh` on any small Linux box; it installs Node 24 if needed, the dependencies and Chromium's headless shell, then serves `POST /collect` behind a bearer token, one browser job at a time. On a 0.5 GB machine it needs swap and `vm.overcommit_memory=1` (the script sets both when it may).
+- **Browser runner** for hosts that cannot start a browser: `Dockerfile.runner`, or `RUNNER_TOKEN=... bash scripts/runner-start.sh` on any small Linux box. It serves `POST /collect` behind a bearer token, one browser job at a time.
+- **Cloudflare-style Worker + D1**: `npm run build:worker`, then publish `dist/worker/`; set `BROWSER_RUNNER_URL` and `RUNNER_TOKEN` to use a runner.
 
 ## Development
 
@@ -146,6 +139,7 @@ npm run test:fixtures    # graded Nordlys Cabins fixtures (DEMOS_DIR=../agent-re
 npm run test:e2e         # Playwright (CHROMIUM_PATH to use an existing Chromium)
 npm run lint
 npm run build:worker
+npm run build:azure      # dist/azure/web + api/dist (Azure Static Web Apps)
 ```
 
 ## Credits
@@ -154,4 +148,4 @@ Checks, fixes and the running example come from **"The Agent-Ready Web"** by **M
 
 ## License
 
-MIT
+MIT, Copyright (c) 2026 Maxim Salnikov. See [LICENSE](LICENSE).

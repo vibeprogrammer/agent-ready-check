@@ -27,7 +27,7 @@ test('renderReportHtml escapes every site-controlled string', async () => {
   assert.ok(!out.includes('<img src=x'), 'no raw img from the site');
   assert.ok(out.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
   // only our own script tags: the module and the JSON-LD block
-  assert.deepEqual([...out.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]).sort(), ['<script type="application/ld+json">', '<script type="module" src="/assets/app.js?v=1">'].sort());
+  assert.deepEqual([...out.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]).sort(), ['<script type="application/ld+json">', '<script type="module" src="/assets/app.js?v=2">'].sort());
   const doc = parseDocument(out);
   const handlers = [...doc.querySelectorAll('*')].filter((el) => [...el.attributes].some((a) => /^on/i.test(a.name)));
   assert.equal(handlers.length, 0, 'no inline event handlers');
@@ -38,7 +38,7 @@ test('renderReportHtml escapes every site-controlled string', async () => {
 test('renderReportHtml has the key parts', async () => {
   const report = await evilReport();
   const out = renderReportHtml(report, { baseUrl: 'https://check.example', reportId: 'r1' });
-  for (const part of ['<main id="main">', 'aria-label="Agent-Ready score', 'isitagentready-compatible level', 'Lighthouse Agentic Browsing view', 'id="layers-h"', 'id="filters"', 'toolname="filter_findings"', 'toolname="scan_site"', 'Copy all fix prompts', 'Where we differ from Cloudflare', 'https://check.example/r/r1', '/badge/example.com.svg', 'What the standard badges mean', 'id="requests"', '<meta name="robots" content="noindex">']) {
+  for (const part of ['<main id="main">', 'aria-label="Agent-Ready score', 'isitagentready-compatible level', 'Lighthouse Agentic Browsing view', 'id="layers-h"', 'id="filters"', 'toolname="filter_findings"', 'toolname="scan_site"', 'Copy all fix prompts', 'https://check.example/r/r1', '/badge/example.com.svg', 'What the standard badges mean', 'id="requests"', '<meta name="robots" content="noindex">']) {
     assert.ok(out.includes(part), `missing ${part}`);
   }
   assert.equal((out.match(/<details class="finding/g) || []).length, report.checks.length);
@@ -113,7 +113,14 @@ test('links and assets', () => {
   assert.equal(chapterLink(3), 'https://github.com/webmaxru/agent-ready-web-demos/tree/main/chapters/03-how-agents-see-a-page');
   assert.equal(chapterLink(1), 'https://github.com/webmaxru/agent-ready-web-demos');
   assert.equal(reportLinks('https://x.example/', 'a b').html, 'https://x.example/r/a%20b');
-  assert.deepEqual(Object.keys(ASSETS).sort(), ['/assets/app.css', '/assets/app.js', '/assets/favicon.svg']);
+  assert.deepEqual(Object.keys(ASSETS).sort(), ['/assets/app.css', '/assets/app.js', '/assets/favicon.svg', '/assets/fonts/silkscreen-400.woff2', '/assets/fonts/silkscreen-700.woff2']);
+  for (const f of ['/assets/fonts/silkscreen-400.woff2', '/assets/fonts/silkscreen-700.woff2']) {
+    assert.equal(ASSETS[f].encoding, 'base64');
+    assert.equal(Buffer.from(ASSETS[f].body, 'base64').subarray(0, 4).toString('latin1'), 'wOF2', `${f} is a woff2 file`);
+  }
   assert.match(ASSETS['/assets/app.js'].body, /registerTool/);
-  assert.match(ASSETS['/assets/app.css'].body, /prefers-color-scheme:dark/);
+  assert.match(ASSETS['/assets/app.css'].body, /prefers-reduced-motion:reduce/);
+  assert.match(ASSETS['/assets/app.css'].body, /:focus-visible/);
+  assert.match(ASSETS['/assets/app.css'].body, /url\(\/assets\/fonts\/silkscreen-700\.woff2\)/);
+  assert.doesNotMatch(ASSETS['/assets/app.css'].body, /https?:\/\//, 'no external URLs in the stylesheet');
 });

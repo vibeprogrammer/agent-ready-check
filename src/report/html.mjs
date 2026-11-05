@@ -2,27 +2,60 @@
 // (the server's CSP allows only 'self').
 //
 // DECISION (H3): the landing page is rendered by renderHomeHtml({ baseUrl }) rather than a static public/index.html,
-// so the server can fill in the base URL, canonical link and the browser-checks option. The stylesheet and the
-// client script are JavaScript strings in src/report/assets.mjs (ASSETS), served by the server at /assets/app.css and
-// /assets/app.js; that works the same in Node and in the Worker without a static-assets binding. public/ is not used.
+// so the server can fill in the base URL, canonical link and the browser-checks option. The stylesheet, the client
+// script and the fonts are strings in src/report/assets.mjs (ASSETS), served by the server at /assets/*; that works the
+// same in Node and in the Worker without a static-assets binding. public/ is not used.
+//
+// Design (v0.2.0): a pixel theme, documented in docs/DESIGN.md. Icons are tiny SVGs drawn from pixel grids (pixelSvg);
+// every status is shown as colour, a distinct glyph and a text label.
 //
 // Every string that comes from a scanned site (messages, evidence, headers, bodies, details) is escaped with esc();
 // only http(s) URLs become links (safeHref).
-import { esc, safeHref, STATUS_LABEL, STATUS_ORDER, STATUS_ICON, MATURITY_LABEL, ROLE_NAMES, grade, hostOf, fmtMs } from './util.mjs';
+import { esc, safeHref, STATUS_LABEL, STATUS_ORDER, MATURITY_LABEL, ROLE_NAMES, grade, hostOf, fmtMs } from './util.mjs';
 import { chapterLink, chapterLabel, reportLinks, BOOK } from './links.mjs';
 import { renderFixPrompts } from './markdown.mjs';
 import { badgeWidth } from './badge.mjs';
 import { SITE } from '../agent-files/site.mjs';
+import catalog from '../catalog.json' with { type: 'json' };
 
-export const ASSET_VERSION = '1';
+export const ASSET_VERSION = '2';
 const LEVEL_NAMES = ['Not Ready', 'Basic Web Presence', 'Bot-Aware', 'Agent-Readable', 'Agent-Integrated', 'Agent-Native'];
 const STATUSES = ['fail', 'warn', 'pass', 'info', 'error', 'skipped', 'neutral'];
 
-/** Page shell shared by the landing page and reports: landmarks, skip link, nav, footer. */
+/** A pixel-art SVG from rows of '#' (on) and '.' (off). Decorative: aria-hidden. */
+export function pixelSvg(rows, { size = 14, cls = 'px', fill = 'currentColor' } = {}) {
+  const w = Math.max(...rows.map((r) => r.length)); const h = rows.length;
+  let d = '';
+  rows.forEach((row, y) => { for (const m of row.matchAll(/#+/g)) d += `M${m.index} ${y}h${m[0].length}v1h-${m[0].length}z`; });
+  const px = Math.round((size * w) / Math.max(w, h));
+  return `<svg class="${cls}" viewBox="0 0 ${w} ${h}" width="${px}" height="${Math.round((px * h) / w)}" aria-hidden="true" focusable="false"><path d="${d}" fill="${fill}"/></svg>`;
+}
+
+// One 7x7 glyph per status, each a different shape (colour-blind safe together with the label).
+const GLYPHS = {
+  pass: ['.......', '......#', '.....##', '#...##.', '##.##..', '.###...', '..#....'],
+  fail: ['#.....#', '##...##', '.##.##.', '..###..', '.##.##.', '##...##', '#.....#'],
+  warn: ['..###..', '..###..', '..###..', '..###..', '.......', '..###..', '..###..'],
+  info: ['..##...', '.......', '.###...', '..##...', '..##...', '..##...', '.####..'],
+  error: ['.#####.', '##...##', '....##.', '...##..', '...##..', '.......', '...##..'],
+  neutral: ['.......', '.......', '.......', '#######', '.......', '.......', '.......'],
+  skipped: ['#######', '#.....#', '#.....#', '#.....#', '#.....#', '#.....#', '#######'],
+};
+export const statusGlyph = (st, size = 14) => pixelSvg(GLYPHS[st] || GLYPHS.error, { size });
+
+const LOGO_ROWS = ['..........', '........#.', '.......##.', '......##..', '.#...##...', '.##.##....', '..###.....', '...#......', '..........', '..........'];
+const LOGO = pixelSvg(LOGO_ROWS, { size: 32, cls: 'logo' })
+  .replace('<path', '<rect width="10" height="10" fill="#1e162b"/><path').replace('fill="currentColor"', 'fill="#5fed83"');
+
+const band = (s) => (s == null ? 'na' : s >= 90 ? 'good' : s >= 70 ? 'ok' : s >= 40 ? 'mid' : 'bad');
+const blocks = (n, on) => Array.from({ length: n }, (_, i) => `<span${i < on ? ' class="on"' : ''}></span>`).join('');
+
+/** Page shell shared by the landing page, reports, docs and error pages: landmarks, skip link, nav, footer. */
 export function shell({ base = '', path = '/', title, description, body, head = '', noindex = false, mdPath = null, jsonld = null }) {
   const b = String(base || '').replace(/\/+$/, '');
   const full = title === SITE.name ? title : `${title} | ${SITE.name}`;
   const canonical = b ? `${b}${path}` : null;
+  const cur = (p) => (path === p || (p !== '/' && path.startsWith(`${p}`)) ? ' aria-current="page"' : '');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -30,8 +63,11 @@ export function shell({ base = '', path = '/', title, description, body, head = 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(full)}</title>
 <meta name="description" content="${esc(description)}">
-<meta name="color-scheme" content="light dark">
-${noindex ? '<meta name="robots" content="noindex">\n' : ''}${canonical ? `<link rel="canonical" href="${esc(canonical)}">\n` : ''}${mdPath ? `<link rel="alternate" type="text/markdown" href="${esc(mdPath)}">\n` : ''}<link rel="stylesheet" href="/assets/app.css?v=${ASSET_VERSION}">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#1e162b">
+${noindex ? '<meta name="robots" content="noindex">\n' : ''}${canonical ? `<link rel="canonical" href="${esc(canonical)}">\n` : ''}${mdPath ? `<link rel="alternate" type="text/markdown" href="${esc(mdPath)}">\n` : ''}<link rel="preload" href="/assets/fonts/silkscreen-700.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/fonts/silkscreen-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/assets/app.css?v=${ASSET_VERSION}">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <meta property="og:title" content="${esc(full)}">
 <meta property="og:description" content="${esc(description)}">
@@ -41,19 +77,32 @@ ${canonical ? `<meta property="og:url" content="${esc(canonical)}">\n` : ''}${js
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="site">
-<a class="brand" href="/"><svg class="logo" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M7 12.5l3.2 3.2L17 9" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>${esc(SITE.name)}</a>
+<a class="brand" href="/">${LOGO}${esc(SITE.name)}</a>
 <nav aria-label="Main">
-<a href="/">Scan</a>
-<a href="/docs">API and MCP</a>
-<a href="/checks">Checks</a>
+<a href="/"${path === '/' ? ' aria-current="page"' : ''}>Scan</a>
+<a href="/docs"${cur('/docs')}>API and MCP</a>
+<a href="/checks"${cur('/checks')}>Checks</a>
 <a href="${esc(SITE.repo)}">Source</a>
 </nav>
 </header>
+<div class="colorbar" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
 <main id="main">
 ${body}
 </main>
 <footer class="site">
-<p>${esc(SITE.name)} ${esc(SITE.version)}, MIT licensed. Checks and fixes come from the book <cite>${esc(BOOK.title)}</cite> by ${esc(BOOK.author)} and its <a href="${esc(BOOK.demos)}">demos</a>. Not affiliated with Cloudflare or Google. <a href="/privacy">Privacy</a>. <a href="/llms.txt">llms.txt</a>.</p>
+<div class="colorbar" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+<div class="wrap">
+<div>
+<p class="fname">${esc(SITE.name)} ${esc(SITE.version)}</p>
+<p>MIT licensed. The checks and fixes come from the book <cite>${esc(BOOK.title)}</cite> by ${esc(BOOK.author)} and its <a href="${esc(BOOK.demos)}">demos</a>. Not affiliated with Cloudflare or Google.</p>
+</div>
+<ul aria-label="More">
+<li><a href="/docs">API, MCP and CLI</a></li>
+<li><a href="/llms.txt">llms.txt</a></li>
+<li><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></li>
+<li><a href="${esc(SITE.repo)}">Source code</a></li>
+</ul>
+</div>
 </footer>
 </body>
 </html>
@@ -64,26 +113,16 @@ ${body}
 export function scanForm({ value = '', browserAvailable = false, id = 'scan', compact = false, tool = true } = {}) {
   const t = tool ? ' toolname="scan_site" tooldescription="Scan a website for agent-readiness: 113 checks in 13 layers (robots.txt and AI crawlers, structured data, Markdown and llms.txt, APIs, MCP, WebMCP, discovery, commerce, identity, security, privacy, performance). Returns the score, the isitagentready-compatible level and the findings with fixes." toolautosubmit' : '';
   return `<form class="scan${compact ? ' compact' : ''}" id="${esc(id)}" action="/scan" method="get" role="search"${t}>
-<label for="${esc(id)}-url">Website address</label>
+<label for="${esc(id)}-url">${compact ? 'Scan again' : 'Website address'}</label>
 <div class="row">
 <input id="${esc(id)}-url" name="url" type="text" inputmode="url" autocomplete="url" spellcheck="false" required placeholder="example.com" value="${esc(value)}"${tool ? ' toolparamdescription="The site or page to scan: a domain like example.com or a full https URL. Public addresses only."' : ''}>
 <button type="submit">Scan</button>
 </div>
-${browserAvailable ? `<label class="check"><input type="checkbox" name="browser" value="1"${tool ? ' toolparamdescription="Also run the browser checks (accessibility tree, axe rules, WebMCP tools, CLS). Slower."' : ''}> Run browser checks (accessibility, WebMCP, layout stability)</label>\n` : ''}<p class="status" id="${esc(id)}-status" role="status" aria-live="polite"></p>
+${browserAvailable ? `<label class="check"><input type="checkbox" name="browser" value="1"${tool ? ' toolparamdescription="Also run the browser checks (accessibility tree, axe rules, WebMCP tools, CLS). Slower."' : ''}>${compact ? ' Also run the browser checks (slower)' : ' Also run the browser checks: accessibility tree, WebMCP tools, layout shift (slower)'}</label>\n` : ''}<p class="status" id="${esc(id)}-status" role="status" aria-live="polite"></p>
 </form>`;
 }
 
-function ring(score) {
-  const C = 2 * Math.PI * 52;
-  const s = score == null ? 0 : Math.max(0, Math.min(100, score));
-  const cls = score == null ? 'na' : s >= 90 ? 'good' : s >= 70 ? 'ok' : s >= 40 ? 'mid' : 'bad';
-  return `<svg class="ring ${cls}" viewBox="0 0 120 120" width="140" height="140" role="img" aria-label="Agent-Ready score ${score == null ? 'not available' : `${s} out of 100`}">
-<circle class="track" cx="60" cy="60" r="52" fill="none" stroke-width="12"/>
-<circle class="bar" cx="60" cy="60" r="52" fill="none" stroke-width="12" stroke-linecap="round" stroke-dasharray="${(C * s / 100).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 60 60)"/>
-<text x="60" y="58" text-anchor="middle" class="num">${score == null ? '–' : s}</text><text x="60" y="80" text-anchor="middle" class="of">of 100</text></svg>`;
-}
-
-const statusBadge = (st) => `<span class="st st-${esc(st)}"><span aria-hidden="true">${STATUS_ICON[st] || '?'}</span> ${esc(STATUS_LABEL[st] || st)}</span>`;
+const statusBadge = (st) => `<span class="st st-${esc(st)}">${statusGlyph(st)}${esc(STATUS_LABEL[st] || st)}</span>`;
 
 function stdBadge(std = {}) {
   const m = MATURITY_LABEL[std.maturity] || { label: 'Unrated', text: '' };
@@ -120,7 +159,7 @@ function exchangeLine(ex) {
 function requestsAppendix(report) {
   const list = Object.values(report.exchanges || {});
   if (!list.length) return '';
-  return `<section class="card requests" id="requests" aria-labelledby="req-h"><h2 id="req-h">Requests made (${list.length})</h2>
+  return `<section class="band requests" id="requests" aria-labelledby="req-h"><h2 id="req-h" class="sh">Requests made (${list.length})</h2>
 <p class="small">Every request this scan sent, with the response headers and the first 2 KB of each body. Cookies are not stored.</p>
 ${list.map((ex) => `<details class="sub" id="ex-${esc(ex.id)}"><summary><code>${esc(ex.request?.method || 'GET')} ${esc(ex.request?.url || '')}</code> → ${esc(ex.response ? ex.response.status : 'failed')}</summary>${exchangeHtml(ex)}</details>`).join('\n')}
 </section>`;
@@ -182,38 +221,44 @@ export function parseFilter(q = {}) {
   return { role: role && (ROLE_NAMES[role] || role === 'all') ? role : 'all', status };
 }
 
-function levelCard(iia) {
-  if (!iia) return '';
-  const steps = LEVEL_NAMES.map((n, i) => `<li class="${i < iia.level ? 'done' : i === iia.level ? 'cur' : ''}"${i === iia.level ? ' aria-current="step"' : ''}><span class="lv">L${i}</span> ${esc(n)}</li>`).join('');
-  const next = iia.next_level ? `<p><strong>Next, Level ${iia.next_level.target} (${esc(iia.next_level.name)}):</strong> ${iia.next_level.requirements.map((r) => `<code>${esc(r)}</code>`).join(', ')}</p>` : '<p>This is the top level.</p>';
-  return `<section class="card level" aria-labelledby="lvl-h"><h2 id="lvl-h">isitagentready-compatible level</h2>
-<p class="big">Level ${esc(iia.level)}</p><p class="small">${esc(iia.level_name)}</p>
-<ol class="steps">${steps}</ol>${next}
-<p class="small">Computed with our re-implementation of the 23 published isitagentready checks and level rules${iia.rules_source ? ` (<a href="https://isitagentready.com/llms-full.txt">rules</a>)` : ''}. Cloudflare's live scanner can differ.</p></section>`;
+/** The six levels as pixel stairs. level = null shows the scale without a current step (landing page). */
+function ladder(level = null) {
+  return `<ol class="ladder" aria-label="isitagentready-compatible levels">${LEVEL_NAMES.map((n, i) => {
+    const cls = level == null ? '' : i < level ? ' done' : i === level ? ' cur' : '';
+    return `<li class="s${i}${cls}"${level === i ? ' aria-current="step"' : ''}><span class="bar">L${i}</span><span class="ln">${esc(n)}</span></li>`;
+  }).join('')}</ol>`;
 }
 
-function lighthouseCard(lh) {
+function levelPanel(iia) {
+  if (!iia) return '<div><h2>isitagentready-compatible level</h2><p>Not computed for this scan.</p></div>';
+  const next = iia.next_level
+    ? `<div class="next"><p><strong>To reach Level ${esc(iia.next_level.target)}, ${esc(iia.next_level.name)}:</strong></p><ul>${iia.next_level.requirements.map((r) => `<li><code>${esc(r)}</code></li>`).join('')}</ul></div>`
+    : '<div class="next"><p>This is the top level.</p></div>';
+  return `<div><h2 id="lvl-h">isitagentready-compatible level: L${esc(iia.level)}, ${esc(iia.level_name)}</h2>
+${ladder(iia.level)}${next}
+<p class="small">Computed with our re-implementation of the 23 published isitagentready checks and level rules${iia.rules_source ? ` (<a href="https://isitagentready.com/llms-full.txt">rules</a>)` : ''}. Cloudflare's live scanner can differ.</p></div>`;
+}
+
+function lighthouseTable(lh) {
   if (!lh) return '';
-  const rows = lh.audits.map((a) => `<tr><th scope="row"><a href="#check-${esc(a.check)}">${esc(a.id)}</a><br><span class="small">${esc(a.group)}</span></th><td>${a.score === null ? `<span class="muted">${esc(a.display === 'notRun' ? 'not run' : a.display === 'informative' ? 'informative' : 'n/a')}</span>` : esc(a.score)}</td><td>${statusBadge(a.status === 'notRun' ? 'skipped' : a.status)}</td></tr>`).join('');
-  return `<section class="card lh" aria-labelledby="lh-h"><h2 id="lh-h">Lighthouse Agentic Browsing view</h2>
-<p class="big">${lh.score === null ? '<span class="muted">Not scored</span>' : `${Math.round(lh.score * 100)}%`}</p><p class="small">${esc(lh.passed)} of ${esc(lh.scored)} scored audits pass</p>
-<div class="tablewrap"><table><thead><tr><th scope="col">Audit</th><th scope="col">Score</th><th scope="col">Status</th></tr></thead><tbody>${rows}</tbody></table></div>
-<p class="small">${esc(lh.note || '')}</p></section>`;
+  const rows = lh.audits.map((a) => `<tr><th scope="row"><a href="#check-${esc(a.check)}">${esc(a.id)}</a><br><span class="small">${esc(a.group)}</span></th><td class="num">${a.score === null ? `<span class="muted">${esc(a.display === 'notRun' ? 'not run' : a.display === 'informative' ? 'informative' : 'n/a')}</span>` : esc(a.score)}</td><td>${statusBadge(a.status === 'notRun' ? 'skipped' : a.status)}</td></tr>`).join('');
+  return `<section class="lh" aria-labelledby="lh-h"><h2 id="lh-h" class="sh">Lighthouse Agentic Browsing view</h2>
+<p class="lhscore">${lh.score === null ? '<span class="muted">Not scored</span>' : `${Math.round(lh.score * 100)}%`}</p><p class="small">${esc(lh.passed)} of ${esc(lh.scored)} scored audits pass. ${esc(lh.note || '')}</p>
+<div class="tablewrap"><table><thead><tr><th scope="col">Audit</th><th scope="col">Score</th><th scope="col">Status</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
-function layersCard(layers) {
+function layersList(layers) {
   const rows = (layers || []).map((l) => {
     const sc = l.applicable ? l.score : null;
-    const cls = sc == null ? 'na' : sc >= 90 ? 'good' : sc >= 70 ? 'ok' : sc >= 40 ? 'mid' : 'bad';
-    return `<li class="layer ${cls}"><a href="#layer-${esc(l.id)}">${esc(l.name)}</a><meter min="0" max="100" low="40" high="70" optimum="100" value="${sc ?? 0}" aria-label="${esc(l.name)} score">${sc ?? 'n/a'}</meter><span class="val">${sc == null ? '<span class="muted">n/a</span>' : esc(sc)}</span></li>`;
+    return `<li class="${band(sc)}"><a href="#layer-${esc(l.id)}">${esc(l.name)}</a><span class="mini band-${band(sc)}" aria-hidden="true">${blocks(10, sc == null ? 0 : Math.round(sc / 10))}</span><span class="val">${sc == null ? 'n/a' : esc(sc)}</span></li>`;
   }).join('');
-  return `<section class="card layers" aria-labelledby="layers-h"><h2 id="layers-h">Layers</h2><ul class="bars">${rows}</ul><p class="small">n/a: the layer does not apply to this site (no API, MCP server, shop or OAuth found) or no check could run.</p></section>`;
+  return `<section class="band" aria-labelledby="layers-h"><h2 id="layers-h" class="sh">Layers</h2><ul class="layers">${rows}</ul><p class="small">Score out of 100 per layer. n/a: the layer does not apply to this site (no API, MCP server, shop or OAuth found) or no check could run.</p></section>`;
 }
 
-function rolesCard(roles, filter, keep) {
+function rolesTable(roles, filter, keep) {
   if (!roles) return '';
-  const rows = Object.entries(roles).map(([k, r]) => `<tr><th scope="row"><a href="?${esc(new URLSearchParams({ ...keep, role: k }).toString())}#findings"${filter?.role === k ? ' aria-current="true"' : ''}>${esc(r.name)}</a></th><td>${r.todo.length}</td><td>${r.done.length}</td></tr>`).join('');
-  return `<section class="card roles" aria-labelledby="roles-h"><h2 id="roles-h">By role</h2><div class="tablewrap"><table><thead><tr><th scope="col">Role</th><th scope="col">To do</th><th scope="col">Done</th></tr></thead><tbody>${rows}</tbody></table></div><p class="small">Roles from the book's Appendix A checklist.</p></section>`;
+  const rows = Object.entries(roles).map(([k, r]) => `<tr><th scope="row"><a href="?${esc(new URLSearchParams({ ...keep, role: k }).toString())}#findings"${filter?.role === k ? ' aria-current="true"' : ''}>${esc(r.name)}</a></th><td class="num">${r.todo.length}</td><td class="num">${r.done.length}</td></tr>`).join('');
+  return `<section class="roles" aria-labelledby="roles-h"><h2 id="roles-h" class="sh">By role</h2><div class="tablewrap"><table><thead><tr><th scope="col">Role</th><th scope="col">To do</th><th scope="col">Done</th></tr></thead><tbody>${rows}</tbody></table></div><p class="small">Roles from the book's Appendix A checklist.</p></section>`;
 }
 
 function filterForm(report, filter, keep) {
@@ -224,7 +269,7 @@ function filterForm(report, filter, keep) {
 ${Object.entries(keep).map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('')}
 <div class="frow"><label for="f-role">Role</label> <select id="f-role" name="role" toolparamdescription="Show findings relevant to one role from the book's Appendix A">${roleOpts}</select></div>
 <fieldset><legend>Status (none checked shows all)</legend>${boxes}</fieldset>
-<button type="submit">Apply filters</button>
+<button type="submit" class="quiet">Apply filters</button>
 </form>`;
 }
 
@@ -248,15 +293,17 @@ export function renderReportHtml(report, { baseUrl = '', reportId, filter, brows
   const targetHref = safeHref(target);
   // On an unstored /scan?url= page the filters must keep the url parameter.
   const keep = id ? {} : { url: host, ...(report.mode?.browser ? { browser: '1' } : {}) };
+  const score = report.score == null ? null : Math.max(0, Math.min(100, Math.round(report.score)));
 
   const byLayer = new Map();
   for (const c of report.checks || []) { if (!byLayer.has(c.layer)) byLayer.set(c.layer, []); byLayer.get(c.layer).push(c); }
   const layerSections = (report.layers || []).map((l) => {
     const cs = (byLayer.get(l.id) || []).sort((a, b) => (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || ((b.weight || 0) - (a.weight || 0)));
     if (!cs.length) return '';
+    const sc = l.applicable ? l.score : null;
     const chapters = String(l.chapters || '').split(',').filter(Boolean).map((n) => `<a href="${esc(chapterLink(n))}">${esc(chapterLabel(n.trim()))}</a>`).join(', ');
     return `<section class="layersec" id="layer-${esc(l.id)}" aria-labelledby="lh-${esc(l.id)}">
-<h3 id="lh-${esc(l.id)}">${esc(l.name)} <span class="score">${l.applicable ? `${esc(l.score)}/100` : 'n/a'}</span></h3>
+<header><h3 id="lh-${esc(l.id)}">${esc(l.name)}</h3><span class="mini band-${band(sc)}" aria-hidden="true">${blocks(10, sc == null ? 0 : Math.round(sc / 10))}</span><span class="lscore">${sc == null ? 'n/a' : `${esc(sc)}/100`}</span></header>
 <p class="small">${esc(l.summary || '')}. Book: ${chapters}.</p>
 ${cs.map((c) => findingHtml(c, report, f)).join('\n')}
 <p class="nomatch small" hidden>No findings in this layer match the filters.</p>
@@ -269,31 +316,35 @@ ${cs.map((c) => findingHtml(c, report, f)).join('\n')}
     ? `with a real browser${report.mode.browser_error ? ` (the browser run failed: ${esc(report.mode.browser_error)})` : ''}`
     : `without a browser, so ${esc(counts.skipped)} browser-only checks were skipped${browserAvailable ? ` (<a href="/scan?url=${esc(encodeURIComponent(target))}&amp;browser=1">scan again with the browser</a>)` : ''}`;
 
+  const tally = [['pass', counts.pass], ['warn', counts.warn], ['fail', counts.fail]].map(([s, n]) => `<li>${statusBadge(s)} <span>${esc(n)}</span></li>`).join('');
   const legend = Object.entries(MATURITY_LABEL).map(([k, v]) => `<li><span class="std std-${k}">${esc(v.label)}</span> ${esc(v.text)}</li>`).join('');
-  const differences = (report.differences || []).map((d) => `<li><strong>${esc(d.topic)}.</strong> ${esc(d.text)}</li>`).join('');
-  const share = L.html || L.badge ? `<section class="card share" aria-labelledby="share-h"><h2 id="share-h">Share</h2>
-${L.html ? `<p>Report link (kept 30 days): <a href="${esc(L.html)}">${esc(L.html)}</a></p>` : ''}
-${L.badge ? `<p><img src="${esc(L.badge)}" alt="Agent-Ready badge for ${esc(host)}" width="${badgeWidth({ score: report.score, level: iia?.level })}" height="20"></p>${copyBlock('Badge Markdown', `[![Agent-Ready score](${L.badge})](${L.html || L.rescan || L.badge})`)}` : ''}
+  const share = L.html || L.badge ? `<section class="band share" aria-labelledby="share-h"><h2 id="share-h" class="sh">Share</h2>
+${L.html ? `<p>Report link, kept 30 days: <a href="${esc(L.html)}">${esc(L.html)}</a></p>` : ''}
+${L.badge ? `<p class="badge"><img src="${esc(L.badge)}" alt="Agent-Ready badge for ${esc(host)}" width="${badgeWidth({ score: report.score, level: iia?.level })}" height="20"></p>${copyBlock('Badge Markdown', `[![Agent-Ready score](${L.badge})](${L.html || L.rescan || L.badge})`)}` : ''}
 <p>Also as ${L.json ? `<a href="${esc(L.json)}">JSON</a>, ` : ''}${L.markdown ? `<a href="${esc(L.markdown)}">Markdown</a>, ` : ''}${L.prompts ? `<a href="${esc(L.prompts)}">fix prompts</a>` : ''}.</p></section>` : '';
 
-  const body = `<div class="top">
-<section class="summary" aria-labelledby="sum-h">
+  const body = `${scanForm({ value: host, browserAvailable, id: 'rescan', compact: true })}
+<section class="rhead" aria-labelledby="sum-h">
+<div class="console">
+<div>
 <h1 id="sum-h">Agent-readiness of <span class="host">${esc(host)}</span></h1>
-<p class="muted">${targetHref ? `<a href="${esc(targetHref)}" rel="nofollow noopener">${esc(target)}</a>` : esc(target)} · scanned <time datetime="${esc(report.scanned_at)}">${esc(String(report.scanned_at || '').replace('T', ' ').slice(0, 16))} UTC</time> in ${esc(fmtMs(report.duration_ms))} · ${esc(report.requests)} requests · ${browserNote}</p>
-<div class="hero">${ring(report.score)}<div><p class="big">${esc(grade(report.score))}</p>
-<p><strong>${esc(counts.pass)}</strong> pass · <strong>${esc(counts.warn)}</strong> warnings · <strong>${esc(counts.fail)}</strong> fail · ${esc(counts.neutral)} not applicable · ${esc(counts.skipped)} skipped${counts.error ? ` · ${esc(counts.error)} errors` : ''}</p>
-<p class="small">Score: the layer scores weighted by layer importance; each check weighs severity × standard maturity. <a href="/checks">How scoring works</a>.</p></div></div>
+<p class="small">${targetHref ? `<a href="${esc(targetHref)}" rel="nofollow noopener">${esc(target)}</a>` : esc(target)} · <time datetime="${esc(report.scanned_at)}">${esc(String(report.scanned_at || '').replace('T', ' ').slice(0, 16))} UTC</time> · ${esc(fmtMs(report.duration_ms))} · ${esc(report.requests)} requests · ${browserNote}</p>
+<div class="score band-${band(score)}" role="img" aria-label="Agent-Ready score ${score == null ? 'not available' : `${score} out of 100`}"><span class="num">${score == null ? '–' : score}</span><span class="of">/100</span></div>
+<div class="meter band-${band(score)}" aria-hidden="true">${blocks(20, score == null ? 0 : Math.round(score / 5))}</div>
+<p class="grade">${esc(grade(report.score))}</p>
+<ul class="tally" aria-label="Check results">${tally}</ul>
+<p class="small">${esc(counts.neutral)} not applicable · ${esc(counts.skipped)} skipped · ${esc(counts.info)} info${counts.error ? ` · ${esc(counts.error)} errors` : ''}. The score weighs each layer by importance and each check by severity and standard maturity. <a href="/checks">How scoring works</a>.</p>
+</div>
+${levelPanel(iia)}
+</div>
 </section>
-${scanForm({ value: host, browserAvailable, id: 'rescan', compact: true })}
+${layersList(report.layers)}
+<div class="band tables">
+${lighthouseTable(lh)}
+${rolesTable(report.roles, f, keep)}
 </div>
-<div class="grid">
-${layersCard(report.layers)}
-${levelCard(iia)}
-${lighthouseCard(lh)}
-${rolesCard(report.roles, f, keep)}
-</div>
-<section id="findings" aria-labelledby="find-h">
-<h2 id="find-h">Findings</h2>
+<section class="band" id="findings" aria-labelledby="find-h">
+<h2 id="find-h" class="sh">Findings</h2>
 <div class="toolbar">
 ${filterForm(report, f, keep)}
 <div class="actions"><a class="btn" href="${esc(L.prompts || '#all-fix-prompts')}" data-copy-all="all-prompts-text">Copy all fix prompts (${todo})</a></div>
@@ -303,7 +354,6 @@ ${layerSections}
 <details class="allprompts" id="all-fix-prompts"><summary>All fix prompts as one Markdown prompt</summary><pre id="all-prompts-text"><code>${esc(prompts)}</code></pre></details>
 </section>
 ${requestsAppendix(report)}
-<section class="card differences" aria-labelledby="diff-h"><h2 id="diff-h">Where we differ from Cloudflare's isitagentready</h2><ul>${differences}</ul></section>
 ${share}
 <p class="live" id="live" role="status" aria-live="polite"></p>`;
 
@@ -318,26 +368,60 @@ ${share}
 
 /**
  * Landing page.
- * @param {{ baseUrl?: string, browserAvailable?: boolean, recent?: Array<{host, score, level, url}> }} [o]
+ * @param {{ baseUrl?: string, browserAvailable?: boolean }} [o]
  */
 export function renderHomeHtml({ baseUrl = '', browserAvailable = false } = {}) {
   const b = String(baseUrl || '').replace(/\/+$/, '');
+  const perLayer = {};
+  for (const c of catalog.checks || []) perLayer[c.layer] = (perLayer[c.layer] || 0) + 1;
+  const layers = (catalog.layers || []).map((l, i) => `<li><span class="n" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><span class="nm">${esc(l.name)}</span><span class="ct">${esc(perLayer[l.id] || 0)} checks</span><span class="sm">${esc(l.summary || '')}</span></li>`).join('');
+  const weights = Object.entries(MATURITY_LABEL).map(([k, v]) => `<li><span class="std std-${k}">${esc(v.label)}</span><span>${esc(v.text)}</span></li>`).join('');
   const body = `<section class="intro" aria-labelledby="home-h">
-<h1 id="home-h">Is your site ready for AI agents?</h1>
-<p class="lead">${esc(SITE.checksCount)} checks across ${esc(SITE.layersCount)} layers, from the accessibility tree and robots.txt to MCP, WebMCP, agent discovery and commerce. Every finding comes with evidence, a fix and a prompt for your coding agent.</p>
+<div>
+<p class="kicker">${esc(SITE.checksCount)} checks · ${esc(SITE.layersCount)} layers</p>
+<h1 id="home-h">Check your site for AI agents</h1>
+<p class="lead">Enter an address. Agent-Ready Check reads it the way crawlers, assistants and browser agents do: robots.txt, structured data, Markdown, APIs, MCP, WebMCP and more. Every finding shows the request it rests on and how to fix it.</p>
 ${scanForm({ browserAvailable, id: 'scan' })}
+</div>
+<aside class="readout" aria-labelledby="out-h">
+<h2 id="out-h">What you get back</h2>
+<p class="scoreline"><b>0–100</b> score, per layer and overall</p>
+${ladder(null)}
+<p>A level from L0 to L5 by isitagentready's published rules, a Lighthouse Agentic Browsing view, and a list of fixes in order of weight.</p>
+</aside>
 </section>
-<section class="grid three" aria-label="What you get">
-<div class="card"><h2>Your score, and theirs</h2><p>An Agent-Ready score per layer, an <strong>isitagentready-compatible Level 0–5</strong> and a <strong>Lighthouse Agentic Browsing</strong> view side by side, with the places where we score differently explained.</p></div>
-<div class="card"><h2>Evidence and fixes</h2><p>Each finding shows the request and response it is based on, why it matters with a link to the book chapter, a copy-paste snippet and a fix prompt for coding agents.</p></div>
-<div class="card"><h2>Honest about standards</h2><p>Every check shows whether it rests on an RFC, a draft or a vendor proposal. Drafts weigh less, so you don't over-invest in something that may change next month.</p></div>
+<section aria-labelledby="layers-list-h">
+<h2 id="layers-list-h" class="sh">What it checks</h2>
+<ol class="layerlist">${layers}</ol>
+<p class="small"><a href="/checks">All ${esc(SITE.checksCount)} checks with their tests and sources</a></p>
 </section>
-<section class="card" aria-labelledby="layers-list-h"><h2 id="layers-list-h">The 13 layers</h2>
-<p>Perception · Crawler access · Structured data · Agent-readable content · APIs · MCP · WebMCP · Discovery · Commerce · Identity and auth · Security · Privacy and consent · Performance and stability. <a href="/checks">See all ${esc(SITE.checksCount)} checks</a>.</p></section>
-<section class="card" aria-labelledby="agents-h"><h2 id="agents-h">For agents and CI</h2>
-<p>This service is agent-ready itself: a <a href="/docs">JSON API</a> (<a href="/openapi.json">OpenAPI</a>), an MCP server at <code>${esc(b || '')}/mcp</code> with a <code>scan_site</code> tool, a WebMCP <code>scan_site</code> tool on this page, an <a href="/.well-known/agent-skills/index.json">Agent Skill</a> and <a href="/llms.txt">llms.txt</a>. In CI: <code>npx agent-ready-check example.com --fail-under 70</code>.</p></section>
-<section class="card" aria-labelledby="book-h"><h2 id="book-h">Based on a book</h2>
-<p>The checks, thresholds and fixes come from <cite>${esc(BOOK.title)}</cite> by ${esc(BOOK.author)}, and its tested demos at <a href="${esc(BOOK.demos)}">github.com/webmaxru/agent-ready-web-demos</a> (MIT). Standards and statuses were read on ${esc(SITE.updated?.checks || '')}.</p></section>`;
+<section class="twocol" aria-label="Findings and weights">
+<div>
+<h2 class="sh">Every finding comes with</h2>
+<dl class="gets">
+<div><dt>Evidence</dt><dd>The exact request and response it is based on.</dd></div>
+<div><dt>Why</dt><dd>Why it matters for agents, with a link to the chapter of the book.</dd></div>
+<div><dt>Fix</dt><dd>A snippet you can copy, adapted to your site where possible.</dd></div>
+<div><dt>Prompt</dt><dd>A fix prompt for your coding agent, or all of them at once.</dd></div>
+</dl>
+</div>
+<div>
+<h2 class="sh">Weighted by maturity</h2>
+<ul class="weights">${weights}</ul>
+</div>
+</section>
+<section class="term" aria-labelledby="agents-h">
+<h2 id="agents-h" class="sh">For agents and CI</h2>
+<pre><code><span class="prompt">$</span> npx agent-ready-check example.com --fail-under 70
+<span class="prompt">POST</span> ${esc(b)}/api/scan <span class="dim">{"url":"example.com"}</span>
+<span class="prompt">MCP</span>  ${esc(b)}/mcp <span class="dim">tool: scan_site</span></code></pre>
+<p>This page is a WebMCP tool too: the scan form above is <code>scan_site</code>.</p>
+<ul class="links"><li><a href="/docs">API, MCP and CLI docs</a></li><li><a href="/openapi.json">OpenAPI</a></li><li><a href="/.well-known/agent-skills/index.json">Agent Skill</a></li><li><a href="/llms.txt">llms.txt</a></li></ul>
+</section>
+<section aria-labelledby="book-h">
+<h2 id="book-h" class="sh">Where the checks come from</h2>
+<p>The checks, thresholds and fixes come from <cite>${esc(BOOK.title)}</cite> by ${esc(BOOK.author)} and its tested demos at <a href="${esc(BOOK.demos)}">github.com/webmaxru/agent-ready-web-demos</a> (MIT). Standards and their status were last read on ${esc(SITE.updated?.checks || '')}.</p>
+</section>`;
   return shell({
     base: b, path: '/', title: SITE.name, description: SITE.description, body,
     jsonld: { '@context': 'https://schema.org', '@graph': [

@@ -1,127 +1,124 @@
 # Deploying Agent-Ready Check
 
-Four ways to run it, from the simplest:
+The production target is **Azure Static Web Apps** with the API as **Azure Functions**, set up once and then deployed by GitHub Actions on every push to `main`. The one-time setup, click by click, is in [docs/PUBLISHING.md](docs/PUBLISHING.md). This page explains the architecture, the decisions and the costs.
 
-| Where | Browser checks | What you run |
-| --- | --- | --- |
-| Your machine (Node 22+) | yes, with Chromium | `npm ci && npm start` (add `BROWSER=1`) |
-| Docker | yes (Playwright base image) | `docker build -t agent-ready-check . && docker run -p 8080:8080 agent-ready-check` |
-| **Azure Container Apps** (this kit) | yes | `./infra/deploy.sh` or `pwsh ./infra/deploy.ps1` |
-| Cloudflare Worker + D1 | no (shown as "skipped") | `npm run build:worker`, then publish `dist/worker/` |
+Other ways to run it (Node, Docker, a Cloudflare-style Worker) are at the end.
 
-## Azure: the one command
+## Architecture on Azure
 
-```bash
-./infra/deploy.sh                 # macOS, Linux, WSL
+```
+visitor / agent
+      |
+      v
+Azure Static Web Apps (Free plan, global edge, free TLS certificate, custom domain agent.isainative.dev)
+  |-- /assets/*  -> static files (CSS, JS, pixel font, favicon) from the Static Web Apps CDN
+  |-- /api/*     -> managed Azure Function "site" (Node 22)
+  `-- every other path -> rewritten to /api/__site -> the same function
+                               |
+                               |-- reports: Azure Blob Storage, container "reports" (30-day lifecycle rule)
+                               `-- browser checks: POST /collect -> browser runner (Azure Container Apps, scales to zero)
 ```
 
-```powershell
-pwsh ./infra/deploy.ps1           # Windows PowerShell 5.1 or PowerShell 7+
-```
+- **One function serves the whole site.** Static Web Apps only routes `/api/*` to functions, so `staticwebapp.config.json` rewrites every non-asset path to `/api/__site`. The function reads the visitor's address from the `x-ms-original-url` header and hands the request to the same Hono app the Node server and the Worker use (`server/azure.mjs`). That keeps everything that makes the service agent-ready: Markdown negotiation with `Vary: Accept`, `Link` headers, `robots.txt`, `llms.txt`, the API catalog, `/.well-known/*`, `/mcp`, report pages and badges. Static Web Apps passes API response headers through unchanged ("Headers in API responses are preserved", [configuration docs](https://learn.microsoft.com/en-us/azure/static-web-apps/configuration)).
+- **Code:** `server/azure-function.mjs` (registration, Azure Functions v4 Node.js model), `server/azure.mjs` (handler), `src/store/azure-blob.mjs` (reports), `scripts/build-azure.mjs` (builds `dist/azure/web` and `api/dist/index.mjs`), `scripts/swa-config.mjs` (routing), `api/` (function app manifest), `Dockerfile.runner` (browser runner image).
+- **Infra:** `infra/main.bicep`, wrapped by `infra/deploy.sh` and `infra/deploy.ps1`.
+- **Pipelines:** `.github/workflows/deploy-azure.yml` (push to `main`), `deploy-infra.yml` (on demand, for example to bind the domain), `npm-publish.yml` (on a GitHub release), `ci.yml` (every PR).
 
-What it does, safe to re-run:
+## Decisions
 
-1. Checks the tools (Azure CLI, Bicep, the `containerapp` extension; Python 3.9+ only for the smoke test) and asks before it touches the subscription you are logged in to (`-Yes` / `--yes` skips the question).
-2. Creates the resource group `rg-agent-ready-check` and deploys `infra/main.bicep`:
-   - a Container Apps environment on the **consumption plan**, and the app `agent-ready-check` with **min 0, max 2 replicas** (scale to zero), 1 vCPU and 2 GiB each, HTTP scaling at 10 concurrent requests;
-   - an **Azure Container Registry, Basic**; the app pulls from it with a **user-assigned managed identity** (AcrPull), so there is no registry password;
-   - a storage account with an **Azure Files share mounted at `/data`** for stored reports (kept 30 days, survive restarts and scale-to-zero);
-   - a **Log Analytics** workspace with 30-day retention and a 0.5 GB daily ingestion cap.
-3. Builds the image **in the registry** with `az acr build` (no local Docker) from the `Dockerfile`, which starts `FROM mcr.microsoft.com/playwright:v1.64.1-noble`, so Chromium is there for the browser checks.
-4. Rolls the image out, waits for `/api/health` and runs `infra/check_site.py` (14 smoke checks: Link headers, Markdown negotiation, robots.txt, llms.txt, API catalog, MCP card and tools/list, Agent Skills digest, ARD, Origin check, problem+json, security headers).
+### Static Web Apps plan: Free
 
-No secret is printed, put on a command line or written to a file. The storage and Log Analytics keys are read by Bicep at deployment time (`listKeys()`).
+| | Free | Standard |
+|---|---|---|
+| Price | 0 | 9 USD per app per month (retail price API, West Europe, read 5 Nov 2026) |
+| Managed functions (the API) | yes | yes |
+| Bring your own Functions app (linked) | no | yes |
+| Custom domains | 2 per app | 5 per app |
+| Bandwidth | 100 GB per subscription included; over quota the site is not served | 100 GB included, then 0.20 USD per GB |
+| SLA | none | yes |
 
-Options (bash / PowerShell):
+Sources: [Static Web Apps plans](https://learn.microsoft.com/en-us/azure/static-web-apps/plans) and [pricing](https://azure.microsoft.com/en-us/pricing/details/app-service/static/), read 5 November 2026.
+
+Free is enough: the API runs as **managed functions**, which every plan includes, and one custom domain is needed. Standard would only be needed for a linked Function App (bring your own functions), managed identity in the API, private endpoints or the SLA. The plan is one parameter (`swaSku`, or the `-Sku` / `--sku` flag, or the Deploy infra workflow input) if that changes.
+
+Managed-function limits that shape the design ([API overview](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-overview), [Functions in Static Web Apps](https://learn.microsoft.com/en-us/azure/static-web-apps/apis-functions), read 5 Nov 2026): HTTP triggers only, the `/api` prefix is fixed, and **each API request may last at most 45 seconds**. The function therefore gives each scan a 30-second network budget (`SCAN_TIMEOUT_MS`) and the browser runner the same, so a scan answers before the limit.
+
+### API: managed functions, not a linked Function App
+
+Managed functions cost nothing extra on the Free plan beyond Functions consumption rates, need no second resource and deploy in the same step as the site. A linked Flex Consumption app would require Standard (+9 USD/month) and a second deployment for no gain here: the API is HTTP-only and stateless.
+
+### Storage: Blob Storage instead of D1
+
+Reports are JSON documents of tens to hundreds of KB, read by id, plus two small pointers (newest report per host for badges, newest per URL for the 10-minute cache). Blob Storage fits that exactly, and a lifecycle rule deletes blobs 30 days after their last write, matching the 30-day retention without a cleanup job. Table Storage was the other cheap option, but its 1 MB entity limit and 64 KB property limit would force splitting large reports. Dropping persistence was rejected because shareable report links and badges are features.
+
+The store talks to the Blob REST API directly with Shared Key signing (no SDK; tested against the Azurite emulator, including a wrong-key rejection). The connection string lives only in the Static Web App's application settings, written by Bicep from the storage account's keys; it never appears in the repository, the workflow logs or GitHub.
+
+Rate limiting is per function instance (in memory), so with several instances the effective limit is a multiple of `RATE_LIMIT`. That is acceptable for a free checker; a shared limiter would need a store write per request.
+
+### Browser checks: a small Container App, optional
+
+Chromium cannot run comfortably inside Functions. The three options:
+
+| Option | Works? | Cost | Verdict |
+|---|---|---|---|
+| Functions on Flex Consumption with Playwright | Flex does not support custom containers, so Chromium's system libraries are not there | consumption rates | rejected |
+| Functions Premium (EP1) with a custom container | yes | always on: 0.169 USD per vCPU-hour + 0.0121 USD per GiB-hour (West Europe), about 154 USD/month for EP1 (1 vCPU, 3.5 GB) | rejected on cost |
+| Azure Playwright Workspaces (remote browsers) | built for running test suites against your own apps; no control over the Chromium build or the `--enable-features=WebMCPTesting` flag the WebMCP checks need | the pricing page shows "30 day free trial (first 100 test minutes)" and a per-minute rate that did not render on 5 Nov 2026; the retail price API still lists only the old Microsoft Playwright Testing meters | rejected |
+| **Container App for the browser runner only** | yes: the existing `server/runner.mjs` in a slim Node 24 image with Chromium's headless shell | scales to zero; inside the monthly free grant for typical use (below) | **chosen** |
+
+The runner is **optional** (`--no-browser-runner` / `-NoBrowserRunner`). Without it the API still runs the 104 checks that need only HTTP or DNS and reports the 9 browser-only checks as "skipped".
+
+The image is built by GitHub Actions and pushed to GitHub Container Registry (free for public images), so no Azure Container Registry is needed (the v0.1.0 kit paid about 5 USD a month for one). The Container App pulls it anonymously, which needs the package to be public (one click, see PUBLISHING.md).
+
+Cold start: when the runner has scaled to zero, the first browser scan waits for a replica to start and pull the image. If that pushes the scan past the 45-second API limit, the report shows the browser checks as failed with the runner's error and a second scan a minute later succeeds. Setting `minReplicas` to 1 removes the cold start at idle rates (see the table). This is a known trade-off, not measured on Azure yet.
+
+## Monthly cost
+
+Prices: [Container Apps pricing](https://azure.microsoft.com/en-us/pricing/details/container-apps/) (free grant) and [Static Web Apps pricing](https://azure.microsoft.com/en-us/pricing/details/app-service/static/), read 5 November 2026; per-unit rates from the Azure retail prices API (`prices.azure.com`), West Europe, read 5 November 2026. Usage figures marked "assumed" are estimates, not measurements on Azure.
+
+| Item | Rate | Free each month | Estimate |
+|---|---|---|---|
+| Static Web Apps, Free plan | 0 | 100 GB bandwidth per subscription | 0 USD |
+| Managed functions (consumption rates) | 0.000016 USD per GB-s, 0.20 USD per million executions | 400,000 GB-s and 1 million executions | 0 USD up to about 160,000 scans (assumed 256 MB for 10 s = 2.5 GB-s per scan) |
+| Blob Storage, Hot LRS | 0.0196 USD per GB-month, 0.054 USD per 10,000 writes, 0.0043 USD per 10,000 reads | none | about 0.02 USD for 1,000 scans (assumed 0.5 MB per report, 3 writes per scan) |
+| Browser runner, Container Apps consumption, 1 vCPU / 2 GiB | active 0.000034 USD per vCPU-s and 0.000004 USD per GiB-s | 180,000 vCPU-s, 360,000 GiB-s, 2 million requests per subscription | 0 USD up to about 1,300 browser scans that each wake the runner alone (assumed 15 s job + 120 s cooldown = 135 s); then about 0.006 USD per such scan; back-to-back scans share one wake-up |
+| Runner kept warm instead (`minReplicas: 1`) | idle 0.000004 USD per vCPU-s and per GiB-s | same grant | about 31 USD/month at 1 vCPU / 2 GiB (2.63 million seconds x (0.000004 + 2 x 0.000004)), before the grant |
+| GitHub Container Registry, public image | 0 | | 0 USD |
+| **Total at idle or light use** | | | **about 0 USD per month (cents for storage)** |
+
+For comparison: Standard plan +9 USD/month; Functions Premium EP1 for browser checks about 154 USD/month.
+
+## What `infra/deploy.sh` / `infra/deploy.ps1` do
+
+Run once from Azure Cloud Shell (nothing to install). Both scripts take the same options:
 
 | bash | PowerShell | Default | Meaning |
-| --- | --- | --- | --- |
-| `--resource-group` | `-ResourceGroup` | `rg-agent-ready-check` | resource group |
-| `--app-name` | `-AppName` | `agent-ready-check` | base name of the resources |
-| `--location` | `-Location` | `westeurope` | region |
-| `--subscription` | `-Subscription` | current | switch subscription first |
-| `--custom-domain HOST` | `-CustomDomain HOST` | none | bind a domain with a free managed certificate |
-| `--base-url URL` | `-BaseUrl URL` | from each request | public origin for absolute links |
-| `--max-replicas N` | `-MaxReplicas N` | 2 | upper bound on replicas (and on cost) |
-| `--rate-limit N` / `--rate-window S` | `-RateLimit N` / `-RateWindow S` | 10 / 600 | scans per client per window |
-| `--upload-only` | `-UploadOnly` | | the app exists: build the image and roll it out, no Bicep |
-| `--no-build` | `-NoBuild` | | do not build an image, re-use the current one |
-| `--skip-smoke` | `-SkipSmoke` | | skip `check_site.py` |
-| `--yes` | `-Yes` | | do not ask |
+|---|---|---|---|
+| `--github-repo OWNER/REPO` | `-GitHubRepo` | (required) | the repository whose workflows may deploy |
+| `--custom-domain HOST` | `-CustomDomain` | | bind it once its CNAME is live (checked first) |
+| `--resource-group` | `-ResourceGroup` | `rg-agent-ready-check` | |
+| `--location` | `-Location` | `westeurope` | storage and runner region |
+| `--swa-location` | `-SwaLocation` | `westeurope` | Static Web App region |
+| `--name` | `-Name` | `agent-ready-check` | name prefix |
+| `--sku Free\|Standard` | `-Sku` | `Free` | Static Web Apps plan |
+| `--subscription` | `-Subscription` | current | |
+| `--runner-image` | `-RunnerImage` | `ghcr.io/<owner>/agent-ready-check-runner:latest` | a placeholder until the image exists |
+| `--no-browser-runner` | `-NoBrowserRunner` | | skip the runner |
+| `--skip-oidc` | `-SkipOidc` | | skip the Entra app and federated credential |
+| `--set-github-variables` | `-SetGitHubVariables` | | write the variables with `gh` |
+| `-y` | `-Yes` | | no prompt |
 
-Everyday commands:
+Steps: register the resource providers, create the resource group, create the Entra app registration `agent-ready-check-github` with a federated credential for `repo:OWNER/REPO:environment:production` and Contributor on the resource group, deploy `infra/main.bicep`, check the CNAME and bind the custom domain if it is live, then print the DNS record and the GitHub variables. Safe to re-run. No secret is printed or written.
 
-```bash
-./infra/deploy.sh --upload-only                       # ship a new version (about 4-7 minutes)
-az containerapp logs show -g rg-agent-ready-check -n agent-ready-check --follow
-az group delete -n rg-agent-ready-check               # remove everything the script created
-```
+Checked offline on 5 November 2026: Bicep CLI 0.48.1 builds `main.bicep` with 0 warnings; `deploy.sh` passes `bash -n` and shellcheck; `deploy.ps1` parses in PowerShell 7.6.9 and is ASCII-only; both scripts ran end to end against a stand-in `az`. Not yet run against Azure.
 
-## Custom domain
+## The Container Apps kit from v0.1.0 is retired
 
-Example: `agent-ready-check.salnikov.no`.
+v0.1.0 ran the whole app in one Azure Container App with a container registry, a file share and Log Analytics (about 5 USD/month idle). It is superseded by Static Web Apps + Functions and removed from `infra/`. It remains available at the [v0.1.0 tag](https://github.com/vibeprogrammer/agent-ready-check/tree/v0.1.0/infra) for anyone who prefers one container.
 
-1. Run the deploy once without a domain. It prints the app's address, `<app>.<hash>.<region>.azurecontainerapps.io`.
-2. In your DNS (for Cloudflare: **proxy off, grey cloud**, so the certificate can be validated), create:
-   - `CNAME agent-ready-check` → the app's address;
-   - `TXT asuid.agent-ready-check` → the environment's domain verification id. The script prints the exact value when the records are missing; it is also `az containerapp env show -g rg-agent-ready-check -n cae-agent-ready-check --query properties.customDomainConfiguration.customDomainVerificationId -o tsv`.
-3. Bind it (and get a free managed certificate):
+## Other ways to run it
 
-```bash
-./infra/deploy.sh --upload-only --no-build --custom-domain agent-ready-check.salnikov.no
-```
-
-```powershell
-pwsh ./infra/deploy.ps1 -UploadOnly -NoBuild -CustomDomain agent-ready-check.salnikov.no
-```
-
-The script checks both records against 1.1.1.1 first and stops with the values to create when they are not there yet. Issuing the certificate can take 10 to 20 minutes. The app needs no configuration change: it builds its absolute links from the request's host (`TRUST_PROXY=1` is set). Pass `--base-url https://agent-ready-check.salnikov.no` if you want the links pinned.
-
-## What it costs
-
-Prices from the Azure retail prices API, region `westeurope`, USD, read on **3 November 2026**. Queries:
-
-- Container Apps: `https://prices.azure.com/api/retail/prices?$filter=serviceName eq 'Azure Container Apps' and armRegionName eq 'westeurope' and priceType eq 'Consumption'`
-- Container Registry: `https://prices.azure.com/api/retail/prices?$filter=serviceName eq 'Container Registry' and armRegionName eq 'westeurope' and priceType eq 'Consumption'`
-- Log Analytics: `https://prices.azure.com/api/retail/prices?$filter=serviceName eq 'Log Analytics' and armRegionName eq 'westeurope' and priceType eq 'Consumption'`
-- Storage (Azure Files): `https://prices.azure.com/api/retail/prices?$filter=serviceName eq 'Storage' and armRegionName eq 'westeurope' and priceType eq 'Consumption' and productName eq 'Files v2'`
-
-| Item | Price (retail API) | Notes |
-| --- | --- | --- |
-| Container Apps vCPU, active | $0.000034 per vCPU-second | "Standard vCPU Active Usage" |
-| Container Apps memory, active | $0.000004 per GiB-second | "Standard Memory Active Usage" |
-| Container Apps vCPU / memory, idle | $0.000004 per vCPU-second / GiB-second | only for replicas kept warm by a minimum; this kit uses min 0 |
-| Container Apps requests | $0.56 per million | |
-| Free grant | 180,000 vCPU-seconds, 360,000 GiB-seconds and 2 million requests per subscription per month | from the Container Apps pricing page, same day |
-| Container Registry, Basic | $0.1666 per day (about $5.00 for 30 days) | 10 GB storage included (pricing page); build time: the retail API lists the first 6,000 task vCPU-seconds a month at $0, then $0.0001 per second |
-| Log Analytics ingestion | $0 for the first 5 GB a month, then $2.99 per GB | the daily cap stops runaway logs |
-| Azure Files, Hot LRS | $0.0271 per GB-month, writes $0.0702 / reads $0.0056 per 10,000 | a report is tens to a few hundred KB |
-
-What that means (our arithmetic, not a quote):
-
-- **Idle**: the app scales to zero, so compute costs nothing. The fixed cost is the registry, about **$5 a month**, plus cents for storage.
-- **A burst of scans**: a replica (1 vCPU, 2 GiB) that wakes up, scans for about 30 seconds and stays up for the scale-down cool-down (300 seconds is the Container Apps default in its scaling docs; not re-checked on 3 November) is about 330 seconds at the active rate, roughly **$0.014**. The free grant covers about **545 such bursts a month**; scans that arrive while a replica is up share it.
-- **Heavy use**: 2,000 separate bursts a month would be about $20 of compute above the free grant. The worst case, one replica busy around the clock for 30 days, is about $82 (vCPU) + $19 (memory) ≈ **$101 a month**; `--max-replicas` caps the multiple of that.
-- The rate limit (10 scans per client per 10 minutes) and the 10-minute result cache keep a single client from running up the bill.
-
-Not included: outbound data transfer (small: reports are JSON), and anything you add (Front Door, a budget alert). To get an email when spending passes a limit, add a budget in Cost Management for the resource group.
-
-## Cloudflare Worker (no browser)
-
-```bash
-npm run build:worker            # dist/worker/_worker.mjs + tab-site.json (D1 binding "DB")
-```
-
-`dist/worker/` is a Worker with static assets: bind a D1 database as `DB` (reports and rate limits; the tables are created on first use). Browser checks report "skipped" there. The landing page is rendered by the Worker, so `/` keeps its Link headers and Markdown negotiation.
-
-## Environment variables (Node and Docker)
-
-| Name | Default | Meaning |
-| --- | --- | --- |
-| `PORT` / `HOST` | 8080 / 0.0.0.0 | listen address |
-| `BASE_URL` | from the request | public origin for absolute links |
-| `REPORTS_DIR` | none (memory) | directory for stored reports |
-| `BROWSER` | off | `1` runs the browser checks (needs playwright-core and Chromium; `CHROMIUM_PATH` overrides the executable) |
-| `RATE_LIMIT` / `RATE_WINDOW` | 10 / 600 | scans per client per window (seconds) |
-| `TRUST_PROXY` | off | `1` behind a proxy: use X-Forwarded-For/Proto/Host |
-| `ALLOW_PRIVATE` | off | `1` allows private and local targets. Local testing only, never on a public deployment |
+- **Node 22+**: `npm ci && npm start` (port 8080; `BROWSER=1` for browser checks with a local Chromium, `REPORTS_DIR=./reports` to keep reports).
+- **Docker**: `docker build -t agent-ready-check . && docker run -p 8080:8080 agent-ready-check` (Playwright base image, browser checks on).
+- **Browser runner alone**: `docker build -f Dockerfile.runner -t agent-ready-check-runner .` then `docker run -p 8080:8080 -e RUNNER_TOKEN=... agent-ready-check-runner`; or `RUNNER_TOKEN=... bash scripts/runner-start.sh` on any small Linux host.
+- **Cloudflare-style Worker + D1**: `npm run build:worker`, then publish `dist/worker/`. Set `BROWSER_RUNNER_URL` and `RUNNER_TOKEN` to use a runner.

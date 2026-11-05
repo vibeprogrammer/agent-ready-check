@@ -96,3 +96,56 @@ jobs:
               if (r.status !== 200) { console.error(p, r.status); process.exit(1); }
               console.log(p, r.status, r.headers.get('content-type'));
             }"
+
+  azure-build:
+    # The Static Web Apps build: static assets + staticwebapp.config.json, and the function bundle, loaded under a
+    # stand-in for @azure/functions and asked for a few pages the way Static Web Apps forwards them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:azure -- --base-url https://ci.example
+      - name: Smoke-test the function bundle
+        run: node scripts/smoke-azure-bundle.mjs
+
+  runner-image:
+    # The browser runner image used by the Azure deployment: build it, start it, run one real browser job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -f Dockerfile.runner -t arc-runner:ci .
+      - name: Start the runner and collect example.com
+        run: |
+          docker run -d --name runner -p 8080:8080 -e RUNNER_TOKEN=ci-token arc-runner:ci
+          for _ in $(seq 1 30); do if curl -fsS http://127.0.0.1:8080/health; then break; fi; sleep 2; done
+          curl -fsS -X POST http://127.0.0.1:8080/collect -H 'authorization: Bearer ci-token' -H 'content-type: application/json' \
+            -d '{"url":"https://example.com/"}' -o collect.json
+          node -e "const r=JSON.parse(require('fs').readFileSync('collect.json','utf8')); if(!r.ok){console.error(r);process.exit(1)} console.log('browser:', r.browser?.version || r.version || 'ok', 'keys:', Object.keys(r).join(','))"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/collect -d '{}')" = 401
+      - if: failure()
+        run: docker logs runner || true
+
+  infra:
+    # Offline checks of the Azure kit: Bicep compiles with no warnings, both deploy scripts parse.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bicep build (warnings fail)
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null 2> bicep.log || { cat bicep.log; exit 1; }
+          if grep -qi warning bicep.log; then cat bicep.log; exit 1; fi
+      - name: deploy.sh parses and passes shellcheck
+        run: bash -n infra/deploy.sh && shellcheck -S warning infra/deploy.sh
+      - name: deploy.ps1 parses and is ASCII-only
+        shell: pwsh
+        run: |
+          $errs = $null; $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./infra/deploy.ps1), [ref]$tokens, [ref]$errs)
+          if ($errs.Count) { $errs | ForEach-Object { $_.ToString() }; exit 1 }
+          $bad = @([System.IO.File]::ReadAllBytes((Resolve-Path ./infra/deploy.ps1)) | Where-Object { $_ -gt 127 }).Count
+          if ($bad) { "non-ASCII bytes: $bad"; exit 1 }

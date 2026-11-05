@@ -64,11 +64,6 @@ export function renderReportMarkdown(report, { baseUrl = '', reportId, format = 
     }
     out.push('');
   }
-  if (report.differences?.length) {
-    out.push('## Where this checker differs from isitagentready', '');
-    for (const d of report.differences) out.push(`- **${mdText(d.topic)}**: ${mdText(d.text)}`);
-    out.push('');
-  }
   if (L.badge) out.push('## Badge', '', mdFence(`[![agent-ready](${L.badge})](${L.html || L.rescan})`, 'markdown'), '');
   out.push(`---`, `Checks and fixes are based on the book *${BOOK.title}* by ${BOOK.author} and its demos (${BOOK.demos}).`, '');
   return out.join('\n');
