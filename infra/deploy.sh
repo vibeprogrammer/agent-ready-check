@@ -1,208 +1,189 @@
 #!/usr/bin/env bash
-# One command to run Agent-Ready Check on Azure Container Apps (consumption plan, scale to zero).
-# macOS / Linux / WSL. Windows: infra/deploy.ps1 does the same.
+# Agent-Ready Check on Azure Static Web Apps: one-time setup (and safe re-runs).
 #
-#   ./infra/deploy.sh                                              # infra + image build + deploy + smoke test
-#   ./infra/deploy.sh --upload-only                                # rebuild the image and roll it out (no Bicep)
-#   ./infra/deploy.sh --upload-only --no-build --custom-domain agent-ready-check.salnikov.no   # only bind the domain
+# Creates or updates, in one resource group (infra/main.bicep):
+#   - the Static Web App (Free plan) that serves the site and runs the API as managed Azure Functions
+#   - a storage account with a "reports" blob container (reports are deleted after 30 days)
+#   - optionally the browser runner: a Container App that scales to zero (Chromium for the browser checks)
+# and, unless --skip-oidc, the GitHub Actions sign-in: an Entra app registration with a federated credential for
+# <owner>/<repo>, environment "production", with Contributor on the resource group. No secret is created for
+# GitHub; the workflows sign in with OIDC. At the end it prints the GitHub repository variables to set.
 #
-# Safe to re-run: the resource group and every resource are created once and updated in place.
-# The image is built in Azure Container Registry (az acr build): no local Docker needed.
+# Runs in Azure Cloud Shell (Bash) as is. Needs az (signed in), curl and python3. PowerShell twin: infra/deploy.ps1.
 #
-# Options (defaults in brackets):
-#   --resource-group NAME  [rg-agent-ready-check]   --app-name NAME [agent-ready-check]
-#   --location REGION      [westeurope]             --subscription ID  switch the Azure subscription first
-#   --custom-domain HOST   bind HOST with a free managed certificate (CNAME + TXT records first, DEPLOY.md)
-#   --base-url URL         public origin for absolute links (default: taken from each request)
-#   --max-replicas N       [2]                      --rate-limit N [10] scans per client per --rate-window S [600]
-#   --upload-only          the app must exist: build the image and roll it out (no Bicep deployment)
-#   --no-build             do not build a new image (re-deploy the current one)
-#   --skip-smoke           do not run infra/check_site.py at the end
-#   --yes, -y              don't ask before changing Azure
-#   -h, --help
+#   ./infra/deploy.sh --github-repo webmaxru/agent-ready-check --custom-domain agent.isainative.dev
+#
+# Options
+#   --github-repo OWNER/REPO   repository whose workflows may deploy (required unless --skip-oidc)
+#   --custom-domain HOST       bind this domain (only once its CNAME points at the app; the script checks)
+#   --resource-group NAME      default rg-agent-ready-check
+#   --location REGION          storage and runner region, default westeurope
+#   --swa-location REGION      Static Web App region (westeurope, eastus2, centralus, westus2, eastasia)
+#   --name NAME                app name prefix, default agent-ready-check
+#   --sku Free|Standard        Static Web Apps plan, default Free
+#   --subscription ID          subscription to use (default: the current one)
+#   --runner-image IMAGE       browser runner image (default ghcr.io/<owner>/agent-ready-check-runner:latest)
+#   --no-browser-runner        skip the runner; browser checks then show as "skipped"
+#   --skip-oidc                do not create the Entra app / federated credential / role assignment
+#   --set-github-variables     also write the repository variables with the GitHub CLI (gh, logged in)
+#   -y, --yes                  no confirmation prompt
 set -euo pipefail
 
-RG=rg-agent-ready-check; APP=agent-ready-check; LOCATION=westeurope; SUBSCRIPTION=""; CUSTOM_DOMAIN=""; BASE_URL=""
-MAX_REPLICAS=2; RATE_LIMIT=10; RATE_WINDOW=600
-YES=0; UPLOAD_ONLY=0; NO_BUILD=0; SKIP_SMOKE=0
-IMAGE_REPO=agent-ready-check
+RG="rg-agent-ready-check"; LOCATION="westeurope"; SWA_LOCATION="westeurope"; NAME="agent-ready-check"; SKU="Free"
+SUBSCRIPTION=""; DOMAIN=""; REPO=""; RUNNER_IMAGE=""; RUNNER=1; OIDC=1; SET_VARS=0; YES=0
+ENVIRONMENT="production"
+PLACEHOLDER_IMAGE="mcr.microsoft.com/k8se/quickstart:latest"
+INFRA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "Option $1 needs a value" >&2; exit 2; }; }
+step() { printf '\n== %s\n' "$1"; }
+ok()   { printf '    OK   %s\n' "$1"; }
+info() { printf '    ..   %s\n' "$1"; }
+warn() { printf '    WARN %s\n' "$1" >&2; }
+die()  { printf '\nERROR: %s\n' "$1" >&2; [ -n "${2:-}" ] && printf 'Next:  %s\n' "$2" >&2; exit 1; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --resource-group) need_arg "$@"; RG=$2; shift 2;;
-    --app-name) need_arg "$@"; APP=$2; shift 2;;
-    --location) need_arg "$@"; LOCATION=$2; shift 2;;
-    --subscription) need_arg "$@"; SUBSCRIPTION=$2; shift 2;;
-    --custom-domain) need_arg "$@"; CUSTOM_DOMAIN=$2; shift 2;;
-    --base-url) need_arg "$@"; BASE_URL=$2; shift 2;;
-    --max-replicas) need_arg "$@"; MAX_REPLICAS=$2; shift 2;;
-    --rate-limit) need_arg "$@"; RATE_LIMIT=$2; shift 2;;
-    --rate-window) need_arg "$@"; RATE_WINDOW=$2; shift 2;;
-    --upload-only) UPLOAD_ONLY=1; shift;;
-    --no-build) NO_BUILD=1; shift;;
-    --skip-smoke) SKIP_SMOKE=1; shift;;
-    --yes|-y) YES=1; shift;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0;;
-    *) echo "Unknown option: $1 (see --help)" >&2; exit 2;;
+    --github-repo) REPO="${2:-}"; shift 2 ;;
+    --custom-domain) DOMAIN="${2:-}"; shift 2 ;;
+    --resource-group) RG="${2:-}"; shift 2 ;;
+    --location) LOCATION="${2:-}"; shift 2 ;;
+    --swa-location) SWA_LOCATION="${2:-}"; shift 2 ;;
+    --name) NAME="${2:-}"; shift 2 ;;
+    --sku) SKU="${2:-}"; shift 2 ;;
+    --subscription) SUBSCRIPTION="${2:-}"; shift 2 ;;
+    --runner-image) RUNNER_IMAGE="${2:-}"; shift 2 ;;
+    --no-browser-runner) RUNNER=0; shift ;;
+    --skip-oidc) OIDC=0; shift ;;
+    --set-github-variables) SET_VARS=1; shift ;;
+    -y|--yes) YES=1; shift ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    *) die "unknown option $1" "./infra/deploy.sh --help" ;;
   esac
 done
-CUSTOM_DOMAIN=$(printf '%s' "$CUSTOM_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's#^https\?://##; s#/.*$##; s#\.$##')
-BASE_URL=${BASE_URL%/}
 
-INFRA_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$INFRA_DIR/.." && pwd)"
-STAMP=$(date +%Y%m%d-%H%M%S)
-
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then c() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
-else c() { printf '%s\n' "$2"; }; fi
-step() { echo; c 36 "== $1"; }
-ok()   { c 32 "   OK   $1"; }
-info() { c 90 "   ..   $1"; }
-warn() { c 33 "   WARN $1"; }
-die()  { echo; c 31 "ERROR: $1"; [ -n "${2:-}" ] && c 33 "Next:  $2"; exit 1; }
-
-DO_INFRA=1; DO_BUILD=1
-[ $UPLOAD_ONLY = 1 ] && DO_INFRA=0
-[ $NO_BUILD = 1 ] && DO_BUILD=0
-
-c 1 "Agent-Ready Check -> Azure Container Apps (consumption, scale to zero)"
-
-# --------------------------------------------------------------------------------------
-step "Checking tools"
-command -v az >/dev/null || die "Azure CLI (az) is not installed." \
-  "macOS: brew install azure-cli | Linux: https://learn.microsoft.com/cli/azure/install-azure-cli | then az login"
-ok "Azure CLI $(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo '?')"
-if [ $DO_INFRA = 1 ]; then
-  az bicep version --only-show-errors >/dev/null 2>&1 || { info "installing Bicep"; az bicep install --only-show-errors; }
-  ok "Bicep"
+case "$SKU" in Free|Standard) ;; *) die "--sku must be Free or Standard" ;; esac
+if [ "$OIDC" = 1 ] && ! printf '%s' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+  die "--github-repo OWNER/REPO is required for the GitHub sign-in" "./infra/deploy.sh --github-repo webmaxru/agent-ready-check (or --skip-oidc)"
 fi
-az extension show --name containerapp >/dev/null 2>&1 || { info "adding the containerapp extension"; az extension add --name containerapp --upgrade --only-show-errors >/dev/null; }
-ok "containerapp extension"
-command -v curl >/dev/null || die "curl is not installed."
-PY=""
-for cand in python3 python; do
-  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then PY=$cand; break; fi
-done
-if [ -n "$PY" ]; then ok "$($PY -V 2>&1) (for the smoke test)"; else warn "Python 3.9+ not found: the smoke test at the end is skipped"; SKIP_SMOKE=1; fi
-[ -f "$ROOT/Dockerfile" ] || die "Dockerfile not found under $ROOT." "Run this script from a full clone of the repo."
+DOMAIN="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's#^https\?://##; s#/.*$##; s#\.$##')"
+OWNER_LC="$(printf '%s' "${REPO%%/*}" | tr '[:upper:]' '[:lower:]')"
 
-# --------------------------------------------------------------------------------------
+command -v az >/dev/null 2>&1 || die "Azure CLI (az) not found" "use Azure Cloud Shell (shell.azure.com), where az is installed and signed in"
+
 step "Azure account"
-az account show >/dev/null 2>&1 || die "Not logged in to Azure." "az login"
-if [ -n "$SUBSCRIPTION" ]; then az account set --subscription "$SUBSCRIPTION" --only-show-errors || die "Cannot switch to subscription $SUBSCRIPTION."; fi
-SUB_NAME=$(az account show --query name -o tsv); SUB_ID=$(az account show --query id -o tsv)
-ok "$SUB_NAME ($SUB_ID)"
-info "Resource group $RG | app $APP ($LOCATION) | domain: ${CUSTOM_DOMAIN:-none} | build: $([ $DO_BUILD = 1 ] && echo yes || echo no) | Bicep: $([ $DO_INFRA = 1 ] && echo yes || echo no)"
-if [ $YES = 0 ]; then
-  read -r -p "    Continue with this subscription? [y/N] " answer
-  case "$answer" in y|Y|yes|YES) ;; *) c 33 "Stopped. Nothing changed."; exit 0;; esac
+[ -n "$SUBSCRIPTION" ] && az account set --subscription "$SUBSCRIPTION"
+SUB_ID="$(az account show --query id -o tsv 2>/dev/null)" || die "not signed in to Azure" "az login"
+TENANT_ID="$(az account show --query tenantId -o tsv)"
+ok "subscription $(az account show --query name -o tsv) ($SUB_ID)"
+
+if [ "$YES" != 1 ]; then
+  printf '\nThis creates or updates resource group %s in %s (Static Web App %s, %s plan%s).\n' "$RG" "$LOCATION" "$NAME" "$SKU" "$([ "$RUNNER" = 1 ] && echo ', browser runner' || true)"
+  read -r -p 'Continue? [y/N] ' a; case "$a" in y|Y|yes) ;; *) exit 1 ;; esac
 fi
 
-current_image() { az containerapp show -g "$RG" -n "$APP" --query 'properties.template.containers[0].image' -o tsv 2>/dev/null || true; }
-acr_name() { az acr list -g "$RG" --query '[0].name' -o tsv 2>/dev/null || true; }
+step "Resource providers"
+for ns in Microsoft.Web Microsoft.Storage Microsoft.App; do
+  [ "$ns" = Microsoft.App ] && [ "$RUNNER" = 0 ] && continue
+  st="$(az provider show -n "$ns" --query registrationState -o tsv 2>/dev/null || echo NotRegistered)"
+  if [ "$st" != Registered ]; then az provider register -n "$ns" --wait >/dev/null; fi
+  ok "$ns"
+done
 
-deploy_bicep() { # $1 = image ('' = placeholder)
-  az deployment group create -g "$RG" -n "agent-ready-check-$STAMP-$2" -f "$INFRA_DIR/main.bicep" \
-    -p appName="$APP" image="$1" baseUrl="$BASE_URL" maxReplicas="$MAX_REPLICAS" rateLimit="$RATE_LIMIT" rateWindowSeconds="$RATE_WINDOW" \
-    --only-show-errors --query properties.outputs -o json >/dev/null || die "Bicep deployment failed." "Read the error above, fix it, re-run (safe to re-run)."
+step "Resource group"
+az group create -n "$RG" -l "$LOCATION" -o none
+ok "$RG"
+
+SP_OBJECT_ID=""; CLIENT_ID=""
+if [ "$OIDC" = 1 ]; then
+  step "GitHub sign-in (Entra app + federated credential)"
+  APP_DISPLAY="$NAME-github"
+  CLIENT_ID="$(az ad app list --display-name "$APP_DISPLAY" --query '[0].appId' -o tsv)"
+  if [ -z "$CLIENT_ID" ]; then
+    CLIENT_ID="$(az ad app create --display-name "$APP_DISPLAY" --sign-in-audience AzureADMyOrg --query appId -o tsv)"
+    ok "app registration $APP_DISPLAY created"
+  else ok "app registration $APP_DISPLAY exists"; fi
+  SP_OBJECT_ID="$(az ad sp list --filter "appId eq '$CLIENT_ID'" --query '[0].id' -o tsv)"
+  [ -z "$SP_OBJECT_ID" ] && SP_OBJECT_ID="$(az ad sp create --id "$CLIENT_ID" --query id -o tsv)"
+  SUBJECT="repo:$REPO:environment:$ENVIRONMENT"
+  if az ad app federated-credential list --id "$CLIENT_ID" --query "[?subject=='$SUBJECT'] | length(@)" -o tsv | grep -qx 0; then
+    TMP="$(mktemp)"
+    printf '{"name":"github-%s","issuer":"https://token.actions.githubusercontent.com","subject":"%s","audiences":["api://AzureADTokenExchange"],"description":"GitHub Actions, %s, environment %s"}' \
+      "$(printf '%s' "$ENVIRONMENT-$REPO" | tr '/.' '--' | cut -c1-100)" "$SUBJECT" "$REPO" "$ENVIRONMENT" > "$TMP"
+    az ad app federated-credential create --id "$CLIENT_ID" --parameters "@$TMP" -o none
+    rm -f "$TMP"
+    ok "federated credential for $SUBJECT"
+  else ok "federated credential for $SUBJECT exists"; fi
+fi
+
+# Runner image: the deploy workflow publishes ghcr.io/<owner>/agent-ready-check-runner. Until it has run once,
+# a public placeholder keeps the Container App deployable; the workflow swaps in the real image.
+if [ "$RUNNER" = 1 ] && [ -z "$RUNNER_IMAGE" ]; then
+  if [ -n "$OWNER_LC" ]; then
+    RUNNER_IMAGE="ghcr.io/$OWNER_LC/agent-ready-check-runner:latest"
+    tok="$(curl -fsS "https://ghcr.io/token?scope=repository:$OWNER_LC/agent-ready-check-runner:pull" 2>/dev/null | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' "https://ghcr.io/v2/$OWNER_LC/agent-ready-check-runner/manifests/latest" || true)"
+    if [ "$code" != 200 ]; then
+      info "runner image not published yet (or not public); using a placeholder until the deploy workflow runs"
+      RUNNER_IMAGE="$PLACEHOLDER_IMAGE"
+    fi
+  else RUNNER_IMAGE="$PLACEHOLDER_IMAGE"; fi
+fi
+
+deploy() { # $1 = custom domain or empty
+  az deployment group create -g "$RG" -n "agent-ready-check-$(date +%Y%m%d%H%M%S)" -f "$INFRA_DIR/main.bicep" \
+    -p appName="$NAME" location="$LOCATION" swaLocation="$SWA_LOCATION" swaSku="$SKU" customDomain="$1" \
+       deployBrowserRunner="$([ "$RUNNER" = 1 ] && echo true || echo false)" runnerImage="$RUNNER_IMAGE" \
+       deployerPrincipalId="$SP_OBJECT_ID" \
+    --query properties.outputs -o json
 }
 
-# --------------------------------------------------------------------------------------
-IMAGE=""
-if [ $DO_INFRA = 1 ]; then
-  step "Resource group $RG"
-  if [ "$(az group exists -n "$RG")" = true ]; then ok "exists"; else az group create -n "$RG" -l "$LOCATION" --only-show-errors -o none; ok "created in $LOCATION"; fi
-  for ns in Microsoft.App Microsoft.ContainerRegistry Microsoft.OperationalInsights Microsoft.Storage Microsoft.ManagedIdentity; do
-    state=$(az provider show -n "$ns" --query registrationState -o tsv 2>/dev/null || echo NotRegistered)
-    [ "$state" = Registered ] || { info "registering $ns"; az provider register -n "$ns" --wait --only-show-errors; }
-  done
-  ok "resource providers registered"
-  IMAGE=$(current_image)
-  case "$IMAGE" in *k8se/quickstart*) IMAGE="";; esac
-  if [ -z "$(acr_name)" ]; then
-    step "Creating the infrastructure (first run, placeholder image)"
-    info "Container Apps environment, registry, storage, logs: 2-5 minutes"
-    deploy_bicep "$IMAGE" infra
-    ok "infrastructure ready"
-  fi
-fi
+step "Deploy infra/main.bicep"
+# A domain is bound only when DNS already points at the app, so the first pass deploys without it (the public origin
+# is then the default host name; it switches to https://<domain> once the domain is bound).
+OUT="$(deploy "")"
+val() { printf '%s' "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['$1']['value'])"; }
+SWA_NAME="$(val staticWebAppName)"; HOST="$(val defaultHostname)"; RUNNER_APP="$(val runnerAppName)"; ORIGIN="$(val publicOrigin)"
+ok "Static Web App $SWA_NAME at https://$HOST"
+[ -n "$RUNNER_APP" ] && ok "browser runner $RUNNER_APP ($(val runnerFqdn))"
 
-ACR=$(acr_name)
-[ -n "$ACR" ] || die "No container registry found in $RG." "Run without --upload-only first: ./infra/deploy.sh"
-
-if [ $DO_BUILD = 1 ]; then
-  step "Building the image in Azure Container Registry ($ACR)"
-  info "uploads the repo (see .dockerignore) and builds FROM the Playwright image: 3-6 minutes"
-  az acr build -r "$ACR" -t "$IMAGE_REPO:$STAMP" -t "$IMAGE_REPO:latest" --platform linux/amd64 --only-show-errors "$ROOT" \
-    || die "Image build failed." "Read the build log above. A failing npm ci usually means package-lock.json is out of date."
-  IMAGE="$(az acr show -n "$ACR" --query loginServer -o tsv)/$IMAGE_REPO:$STAMP"
-  ok "built $IMAGE"
-else
-  [ -n "$IMAGE" ] || IMAGE=$(current_image)
-  case "$IMAGE" in ""|*k8se/quickstart*) die "No built image to deploy yet." "Run without --no-build.";; esac
-  ok "re-using $IMAGE"
-fi
-
-if [ $DO_INFRA = 1 ]; then
-  step "Deploying the app (Bicep)"
-  deploy_bicep "$IMAGE" app
-  ok "deployed"
-elif [ $DO_BUILD = 1 ]; then
-  step "Rolling out the new image"
-  az containerapp update -g "$RG" -n "$APP" --image "$IMAGE" --only-show-errors -o none || die "Update failed."
-  ok "rolled out"
-fi
-
-FQDN=$(az containerapp show -g "$RG" -n "$APP" --query properties.configuration.ingress.fqdn -o tsv)
-URL="https://$FQDN"
-
-# --------------------------------------------------------------------------------------
-if [ -n "$CUSTOM_DOMAIN" ]; then
-  step "Custom domain $CUSTOM_DOMAIN"
-  ENV_NAME=$(az containerapp show -g "$RG" -n "$APP" --query properties.managedEnvironmentId -o tsv | sed 's#.*/##')
-  VERIFY_ID=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query properties.customDomainConfiguration.customDomainVerificationId -o tsv)
-  if command -v dig >/dev/null; then
-    CNAME=$(dig +short CNAME "$CUSTOM_DOMAIN" @1.1.1.1 | sed 's/\.$//' | head -1)
-    TXT=$(dig +short TXT "asuid.$CUSTOM_DOMAIN" @1.1.1.1 | tr -d '"' | head -1)
+BOUND=0
+if [ -n "$DOMAIN" ]; then
+  step "Custom domain $DOMAIN"
+  cname="$( (command -v dig >/dev/null && dig +short CNAME "$DOMAIN") || (nslookup -type=CNAME "$DOMAIN" 2>/dev/null | sed -n 's/.*canonical name = //p') || true)"
+  cname="${cname%.}"
+  if [ "$cname" = "$HOST" ]; then
+    info "CNAME $DOMAIN -> $HOST found; binding (Azure validates it and issues the certificate, a few minutes)"
+    if OUT="$(deploy "$DOMAIN")"; then BOUND=1; ORIGIN="$(val publicOrigin)"; ok "bound https://$DOMAIN"; else warn "binding failed; DNS may still be propagating. Re-run this script later."; fi
   else
-    CNAME=$(nslookup -type=CNAME "$CUSTOM_DOMAIN" 1.1.1.1 2>/dev/null | sed -n 's/.*canonical name = \(.*\)\.$/\1/p' | head -1)
-    TXT=$(nslookup -type=TXT "asuid.$CUSTOM_DOMAIN" 1.1.1.1 2>/dev/null | sed -n 's/.*text = "\(.*\)"/\1/p' | head -1)
-  fi
-  if [ "$CNAME" != "$FQDN" ] || [ "$TXT" != "$VERIFY_ID" ]; then
-    warn "DNS is not ready yet. Create these two records (Cloudflare: proxy OFF, grey cloud), then re-run:"
-    echo "        CNAME  $CUSTOM_DOMAIN  ->  $FQDN        (now: ${CNAME:-none})"
-    echo "        TXT    asuid.$CUSTOM_DOMAIN  =  $VERIFY_ID   (now: ${TXT:-none})"
-    echo "        ./infra/deploy.sh --upload-only --no-build --custom-domain $CUSTOM_DOMAIN"
-  else
-    ok "CNAME and TXT records found"
-    az containerapp hostname add -g "$RG" -n "$APP" --hostname "$CUSTOM_DOMAIN" --only-show-errors -o none 2>/dev/null || info "hostname already added"
-    info "issuing a free managed certificate: up to 10-20 minutes"
-    az containerapp hostname bind -g "$RG" -n "$APP" --hostname "$CUSTOM_DOMAIN" --environment "$ENV_NAME" --validation-method CNAME --only-show-errors -o none \
-      || die "Binding $CUSTOM_DOMAIN failed." "Check that the CNAME is DNS-only (not proxied), wait a few minutes, re-run the same command."
-    ok "https://$CUSTOM_DOMAIN is bound"
-    URL="https://$CUSTOM_DOMAIN"
+    warn "CNAME for $DOMAIN is '${cname:-missing}', expected $HOST. Add the record below, wait for DNS, then re-run (or run the Deploy infra workflow)."
   fi
 fi
 
-# --------------------------------------------------------------------------------------
-step "Checking $URL"
-code=0
-for _ in $(seq 1 18); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$URL/api/health" || true)
-  [ "$code" = 200 ] && break
-  info "waiting for the first replica (cold start pulls the image): HTTP $code"
-  sleep 10
-done
-[ "$code" = 200 ] && ok "$URL/api/health -> 200" || warn "$URL/api/health -> $code (the app may still be starting; check: az containerapp logs show -g $RG -n $APP)"
-if [ $SKIP_SMOKE = 0 ] && [ "$code" = 200 ]; then
-  EXPECT_BROWSER=1 "$PY" "$INFRA_DIR/check_site.py" "$URL" || warn "some smoke checks failed (see above)"
-fi
+step "Done"
+cat <<EOF
 
-echo
-c 1 "Done."
-echo "   Site:   $URL"
-echo "   API:    $URL/openapi.json"
-echo "   MCP:    $URL/mcp"
-echo "   Logs:   az containerapp logs show -g $RG -n $APP --follow"
-echo "   Remove: az group delete -n $RG   (deletes everything this script created)"
+DNS record to add at the registrar of ${DOMAIN:-your domain}:
+  Type CNAME   Host ${DOMAIN%%.*}   Value $HOST   TTL 3600
+  (full name ${DOMAIN:-<subdomain>.<domain>}; Static Web Apps validates a subdomain by this CNAME, no TXT record needed)
+
+GitHub repository variables (Settings > Secrets and variables > Actions > Variables):
+  AZURE_CLIENT_ID          $CLIENT_ID
+  AZURE_TENANT_ID          $TENANT_ID
+  AZURE_SUBSCRIPTION_ID    $SUB_ID
+  AZURE_RESOURCE_GROUP     $RG
+  AZURE_STATIC_WEB_APP     $SWA_NAME
+  AZURE_RUNNER_APP         ${RUNNER_APP:-(none)}
+  PUBLIC_BASE_URL          $ORIGIN
+EOF
+
+if [ "$SET_VARS" = 1 ] && [ "$OIDC" = 1 ]; then
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    for kv in "AZURE_CLIENT_ID=$CLIENT_ID" "AZURE_TENANT_ID=$TENANT_ID" "AZURE_SUBSCRIPTION_ID=$SUB_ID" "AZURE_RESOURCE_GROUP=$RG" \
+              "AZURE_STATIC_WEB_APP=$SWA_NAME" "AZURE_RUNNER_APP=$RUNNER_APP" "PUBLIC_BASE_URL=$ORIGIN"; do
+      [ -z "${kv#*=}" ] && continue
+      gh variable set "${kv%%=*}" --repo "$REPO" --body "${kv#*=}" && ok "variable ${kv%%=*}"
+    done
+  else warn "gh is not installed or not logged in; set the variables by hand (docs/PUBLISHING.md)"; fi
+fi
+[ -n "$DOMAIN" ] && [ "$BOUND" = 0 ] && info "custom domain not bound yet: add the CNAME, then re-run with --custom-domain $DOMAIN"
+exit 0

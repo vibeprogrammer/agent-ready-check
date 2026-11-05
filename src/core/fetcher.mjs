@@ -5,7 +5,7 @@
 // Runtime-neutral: the transport (Node http/https or Worker fetch) and the resolver are injected.
 import { isBlockedIP, isIPLiteral } from './net.mjs';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 export const DEFAULT_UA = `AgentReadyCheck/${VERSION} (+https://github.com/vibeprogrammer/agent-ready-check; agent-readiness checker)`;
 
 export class FetchBlockedError extends Error {

@@ -84,7 +84,7 @@ export function mcpSignals(ctx) {
 }
 
 const MCP_LEGACY_PROTOCOL = '2025-11-25';
-const CLIENT_INFO = { name: 'agent-ready-check', version: '0.1.0' };
+const CLIENT_INFO = { name: 'agent-ready-check', version: '0.2.0' };
 /** The 2026-07-28 per-request envelope (book chapter 8: no handshake, _meta on every request). */
 export const mcpMeta = (v = MCP_PROTOCOL) => ({ 'io.modelcontextprotocol/protocolVersion': v, 'io.modelcontextprotocol/clientCapabilities': {}, 'io.modelcontextprotocol/clientInfo': CLIENT_INFO });
 

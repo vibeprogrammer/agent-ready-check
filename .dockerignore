@@ -9,3 +9,6 @@ infra
 *.log
 .env
 .env.*
+api
+docs
+test

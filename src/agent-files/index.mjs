@@ -76,7 +76,7 @@ export function llmsTxt(base) {
     '',
     `- [Privacy](${b}/privacy.md): what is stored (reports for 30 days) and what is not.`,
     `- [Terms of use](${b}/terms.md): fair use of the free scanner and its API.`,
-    `- [Source code](${SITE.repo}): MIT licensed; self-host on Node, Docker, Azure Container Apps or a Cloudflare Worker.`,
+    `- [Source code](${SITE.repo}): MIT licensed; self-host on Node, Docker, Azure Static Web Apps with Azure Functions, or a Cloudflare Worker.`,
     `- [Book demos](${SITE.demos}): the Nordlys Cabins demo site, agent-ready layer by layer, by ${SITE.author}.`,
     '',
   ].join('\n');

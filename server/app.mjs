@@ -71,7 +71,7 @@ export function createApp(o) {
   const app = new Hono();
   // gzip/deflate for text responses of 1 KB or more on Node (event streams excluded by the middleware). On Workers
   // the runtime compresses on the wire when Content-Encoding is set (server/worker.mjs), so the app must not.
-  if (runtime === 'node') app.use('*', compress());
+  if (runtime === 'node' || runtime === 'azure') app.use('*', compress());
   const cache = new Map(); // key -> { report, at }
   const inflight = new Map(); // key -> promise
   let selfScans = 0;
@@ -287,7 +287,9 @@ export function createApp(o) {
   app.get('/.well-known/security.txt', (c) => sendText(c, files.securityTxt(baseOf(c)), 'text/plain; charset=utf-8', { 'cache-control': 'public, max-age=86400' }));
   app.get('/.well-known/gpc.json', (c) => sendText(c, JSON.stringify(files.gpcJson()), 'application/json'));
   for (const [path, a] of Object.entries(R.ASSETS || {})) {
-    app.get(path, (c) => sendText(c, a.body, a.type, { 'cache-control': 'public, max-age=86400' }));
+    // Binary assets (fonts) are stored base64-encoded; decode once to bytes (atob works in Node and Workers).
+    const body = a.encoding === 'base64' ? Uint8Array.from(atob(a.body), (ch) => ch.charCodeAt(0)) : a.body;
+    app.get(path, (c) => sendText(c, body, a.type, { 'cache-control': 'public, max-age=86400' }));
   }
 
   // ---- pages

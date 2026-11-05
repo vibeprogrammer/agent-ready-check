@@ -4,7 +4,6 @@ import { ScanContext } from './context.mjs';
 import { CHECKS, LAYERS, catalog } from '../checks/index.mjs';
 import { commerceSignals } from './discover.mjs';
 import { effectiveWeight, layerScores, overallScore, iiaCompat, lighthouseView, roleView } from './score.mjs';
-import { DIFFERENCES } from './differences.mjs';
 
 export { VERSION };
 
@@ -76,7 +75,6 @@ export async function scan(input, o) {
     compat: { isitagentready: iiaCompat(results, commerce.isCommerce), lighthouse_agentic: lighthouseView(results) },
     commerce,
     roles: roleView(results),
-    differences: DIFFERENCES,
     checks: results,
     exchanges,
   };

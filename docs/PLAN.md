@@ -273,15 +273,6 @@ Counts: 113 checks; 23/23 isitagentready checks mirrored; 7/7 Lighthouse Agentic
 - Role view: each check is tagged with the Appendix A roles (developer, designer, content/SEO, PM, architect, QA,
   security, analytics); the report filters by role.
 
-### Where we differ from Cloudflare (stated in every report)
-- Our checks are often stricter than their compat twin: Markdown without `Vary: Accept` is a warn; a robots.txt that
-  blocks search and user fetchers while allowing training is a warn even though IIAR passes it; a soft-404 site gets
-  flagged because it makes every well-known probe ambiguous.
-- We score drafts lower (maturity factor) and do not need commerce/OAuth on sites that have no shop or API.
-- We add layers IIAR does not look at: perception, structured data, security, privacy, performance.
-- Compat results are our re-implementation of the published rules. When Cloudflare's live scanner disagrees, the report
-  says so (the comparison table in milestone 2 measures how often).
-
 ## 5. Report design
 
 Each finding: status, message, evidence (request line, key response headers, status, a 2 KB body excerpt), why it matters

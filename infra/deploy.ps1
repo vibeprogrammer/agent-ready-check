@@ -1,59 +1,50 @@
 <#
 .SYNOPSIS
-  One command to run Agent-Ready Check on Azure Container Apps (consumption plan, scale to zero).
+  Agent-Ready Check on Azure Static Web Apps: one-time setup (and safe re-runs).
 
 .DESCRIPTION
-  Creates (or updates) the resource group rg-agent-ready-check with a Container Apps environment,
-  the container app, an Azure Container Registry (Basic), a storage account with an Azure Files share
-  for stored reports and a Log Analytics workspace (infra/main.bicep). Builds the image in the
-  registry with `az acr build` (no local Docker needed), rolls it out, optionally binds a custom
-  domain with a free managed certificate and runs the smoke test (infra/check_site.py).
+  Creates or updates, in one resource group (infra/main.bicep):
+    - the Static Web App (Free plan) that serves the site and runs the API as managed Azure Functions
+    - a storage account with a "reports" blob container (reports are deleted after 30 days)
+    - optionally the browser runner: a Container App that scales to zero (Chromium for the browser checks)
+  and, unless -SkipOidc, the GitHub Actions sign-in: an Entra app registration with a federated credential for
+  OWNER/REPO, environment "production", with Contributor on the resource group. No secret is created for GitHub;
+  the workflows sign in with OIDC. At the end it prints the GitHub repository variables to set.
 
-  Safe to re-run: existing resources are updated in place. No secret is printed, put on a command
-  line or written to a file: the app pulls its image with a managed identity.
-
-  Works in Windows PowerShell 5.1 and PowerShell 7+ (Windows, macOS, Linux).
-  macOS/Linux bash twin: infra/deploy.sh.
+  Runs in Azure Cloud Shell (PowerShell) as is, and in PowerShell 7+ or Windows PowerShell 5.1 with the Azure CLI.
+  Bash twin: infra/deploy.sh.
 
 .EXAMPLE
-  pwsh ./infra/deploy.ps1
+  ./infra/deploy.ps1 -GitHubRepo webmaxru/agent-ready-check -CustomDomain agent.isainative.dev
 .EXAMPLE
-  pwsh ./infra/deploy.ps1 -UploadOnly
-.EXAMPLE
-  pwsh ./infra/deploy.ps1 -UploadOnly -NoBuild -CustomDomain agent-ready-check.salnikov.no
-.EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\infra\deploy.ps1 -Yes
+  ./infra/deploy.ps1 -GitHubRepo webmaxru/agent-ready-check -NoBrowserRunner -Yes
 #>
 [CmdletBinding()]
 param(
-  [string]$ResourceGroup = 'rg-agent-ready-check',
-  [string]$AppName = 'agent-ready-check',
-  [string]$Location = 'westeurope',
-  [string]$Subscription = '',
+  [string]$GitHubRepo = '',
   [string]$CustomDomain = '',
-  [string]$BaseUrl = '',
-  [ValidateRange(1, 10)]
-  [int]$MaxReplicas = 2,
-  [ValidateRange(1, 100000)]
-  [int]$RateLimit = 10,
-  [ValidateRange(10, 86400)]
-  [int]$RateWindow = 600,
-  [switch]$UploadOnly,
-  [switch]$NoBuild,
-  [switch]$SkipSmoke,
+  [string]$ResourceGroup = 'rg-agent-ready-check',
+  [string]$Location = 'westeurope',
+  [ValidateSet('westeurope', 'eastus2', 'centralus', 'westus2', 'eastasia')]
+  [string]$SwaLocation = 'westeurope',
+  [string]$Name = 'agent-ready-check',
+  [ValidateSet('Free', 'Standard')]
+  [string]$Sku = 'Free',
+  [string]$Subscription = '',
+  [string]$RunnerImage = '',
+  [switch]$NoBrowserRunner,
+  [switch]$SkipOidc,
+  [switch]$SetGitHubVariables,
   [switch]$Yes
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ImageRepo = 'agent-ready-check'
+$EnvironmentName = 'production'
+$PlaceholderImage = 'mcr.microsoft.com/k8se/quickstart:latest'
 $InfraDir = $PSScriptRoot
-$Root = Split-Path -Parent $InfraDir
-$stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-$IsWin = ($env:OS -eq 'Windows_NT')
-# az acr build streams build logs; on Windows consoles a non-ASCII log line can crash the CLI without this.
-$env:PYTHONIOENCODING = 'utf-8'
+$Runner = -not $NoBrowserRunner
 
 function Write-Step([string]$Text) { Write-Host ''; Write-Host ("== {0}" -f $Text) -ForegroundColor Cyan }
 function Write-Ok([string]$Text) { Write-Host ("    OK   {0}" -f $Text) -ForegroundColor Green }
@@ -65,224 +56,184 @@ function Exit-WithHint([string]$Text, [string]$Hint) {
   if ($Hint) { Write-Host ("Next:  {0}" -f $Hint) -ForegroundColor Yellow }
   exit 1
 }
-# Runs a native program and captures stdout/stderr. A program that cannot even be started (for example the
-# Windows Store 'python3.exe' alias, which PowerShell cannot start with redirected output) is reported as
-# exit code 9009 instead of throwing.
-function Invoke-Native {
-  param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Arguments = @())
+
+# Run az and return its trimmed stdout; throw with stderr when it fails.
+function Invoke-Az {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments, [switch]$AllowFail)
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try {
-    $all = & $Exe @Arguments 2>&1; $code = $LASTEXITCODE
-  } catch {
-    return [pscustomobject]@{ Code = 9009; Out = ''; Err = $_.Exception.Message }
-  } finally { $ErrorActionPreference = $prev }
-  $outLines = @(); $errLines = @()
-  foreach ($line in @($all)) {
-    if ($line -is [System.Management.Automation.ErrorRecord]) { $errLines += $line.ToString() } else { $outLines += [string]$line }
+  try { $out = & az @Arguments 2>&1; $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
+  $text = (@($out) | ForEach-Object { "$_" }) -join "`n"
+  if ($code -ne 0) {
+    if ($AllowFail) { return $null }
+    throw ("az {0} failed: {1}" -f ($Arguments[0..1] -join ' '), $text)
   }
-  return [pscustomobject]@{ Code = $code; Out = (($outLines -join "`n").Trim()); Err = (($errLines -join "`n").Trim()) }
-}
-function Invoke-Az {
-  param([string[]]$Arguments, [string]$What, [switch]$AllowFail)
-  $r = Invoke-Native -Exe 'az' -Arguments ($Arguments + @('--only-show-errors'))
-  if ($r.Code -ne 0 -and -not $AllowFail) { Exit-WithHint ("{0} failed: {1}" -f $What, $r.Err) 'Fix the cause above, then re-run (safe to re-run).' }
-  return $r
-}
-function Get-DnsValue([string]$Name, [string]$Type) {
-  try {
-    $rec = Resolve-DnsName -Name $Name -Type $Type -Server 1.1.1.1 -DnsOnly -ErrorAction Stop | Where-Object { $_.QueryType -eq $Type } | Select-Object -First 1
-    if (-not $rec) { return '' }
-    if ($Type -eq 'CNAME') { return ([string]$rec.NameHost).TrimEnd('.') }
-    return (@($rec.Strings) -join '')
-  } catch {
-    if (Get-Command nslookup -ErrorAction SilentlyContinue) {
-      $out = (& nslookup "-type=$Type" $Name 1.1.1.1 2>$null) -join "`n"
-      if ($Type -eq 'CNAME') { $m = [regex]::Match($out, 'canonical name\s*=\s*(\S+)'); if ($m.Success) { return $m.Groups[1].Value.TrimEnd('.') } }
-      else { $m = [regex]::Match($out, 'text\s*=\s*"([^"]*)"'); if ($m.Success) { return $m.Groups[1].Value } }
-    }
-    return ''
-  }
-}
-function Get-CurrentImage {
-  $r = Invoke-Az -Arguments @('containerapp', 'show', '-g', $ResourceGroup, '-n', $AppName, '--query', 'properties.template.containers[0].image', '-o', 'tsv') -What 'Reading the app' -AllowFail
-  if ($r.Code -ne 0) { return '' }
-  return $r.Out
-}
-function Get-AcrName {
-  $r = Invoke-Az -Arguments @('acr', 'list', '-g', $ResourceGroup, '--query', '[0].name', '-o', 'tsv') -What 'Listing registries' -AllowFail
-  if ($r.Code -ne 0) { return '' }
-  return $r.Out
-}
-function Invoke-Bicep([string]$Image, [string]$Tag) {
-  $args2 = @('deployment', 'group', 'create', '-g', $ResourceGroup, '-n', ("agent-ready-check-{0}-{1}" -f $stamp, $Tag),
-    '-f', (Join-Path $InfraDir 'main.bicep'),
-    '-p', ("appName={0}" -f $AppName), ("image={0}" -f $Image), ("baseUrl={0}" -f $BaseUrl),
-    ("maxReplicas={0}" -f $MaxReplicas), ("rateLimit={0}" -f $RateLimit), ("rateWindowSeconds={0}" -f $RateWindow),
-    '--query', 'properties.outputs', '-o', 'json')
-  Invoke-Az -Arguments $args2 -What 'Bicep deployment' | Out-Null
+  return $text.Trim()
 }
 
+if (-not $SkipOidc -and $GitHubRepo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+  Exit-WithHint '-GitHubRepo OWNER/REPO is required for the GitHub sign-in' './infra/deploy.ps1 -GitHubRepo webmaxru/agent-ready-check (or -SkipOidc)'
+}
 $CustomDomain = ($CustomDomain.ToLowerInvariant() -replace '^https?://', '' -replace '/.*$', '').TrimEnd('.')
-$BaseUrl = $BaseUrl.TrimEnd('/')
-$doInfra = -not $UploadOnly
-$doBuild = -not $NoBuild
+$OwnerLc = ''
+if ($GitHubRepo) { $OwnerLc = $GitHubRepo.Split('/')[0].ToLowerInvariant() }
 
-Write-Host 'Agent-Ready Check -> Azure Container Apps (consumption, scale to zero)' -ForegroundColor White
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+  Exit-WithHint 'Azure CLI (az) not found' 'use Azure Cloud Shell (shell.azure.com), where az is installed and signed in'
+}
 
-# ---------------------------------------------------------------------------------------
-Write-Step 'Checking tools'
-if (-not (Get-Command az -CommandType Application -ErrorAction SilentlyContinue)) {
-  Exit-WithHint 'Azure CLI (az) is not installed.' 'winget install -e --id Microsoft.AzureCLI (macOS: brew install azure-cli), then az login'
-}
-$azv = Invoke-Native -Exe 'az' -Arguments @('version', '--query', '"azure-cli"', '-o', 'tsv')
-Write-Ok ("Azure CLI {0}" -f $azv.Out)
-if ($doInfra) {
-  $bv = Invoke-Native -Exe 'az' -Arguments @('bicep', 'version', '--only-show-errors')
-  if ($bv.Code -ne 0) { Write-Info 'installing Bicep'; Invoke-Az -Arguments @('bicep', 'install') -What 'Installing Bicep' | Out-Null }
-  Write-Ok 'Bicep'
-}
-$ext = Invoke-Native -Exe 'az' -Arguments @('extension', 'show', '--name', 'containerapp')
-if ($ext.Code -ne 0) { Write-Info 'adding the containerapp extension'; Invoke-Az -Arguments @('extension', 'add', '--name', 'containerapp', '--upgrade') -What 'Adding the containerapp extension' | Out-Null }
-Write-Ok 'containerapp extension'
-# Python is only needed for the smoke test. -CommandType Application skips aliases and functions; the
-# Windows Store 'python3' alias is caught by Invoke-Native (exit 9009) and does not count.
-$py = $null
-$cands = if ($IsWin) { @('py', 'python', 'python3') } else { @('python3', 'python') }
-foreach ($cand in $cands) {
-  $cmd = Get-Command $cand -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($cmd) {
-    $v = Invoke-Native -Exe $cand -Arguments @('-c', 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')
-    if ($v.Code -eq 0 -and $v.Out -eq '1') { $py = $cand; break }
-  }
-}
-if ($py) { $pv = Invoke-Native -Exe $py -Arguments @('-V'); Write-Ok ("{0} (for the smoke test)" -f $pv.Out) }
-else { Write-Warn2 'Python 3.9+ not found: the smoke test at the end is skipped (winget install -e --id Python.Python.3.12)'; $SkipSmoke = $true }
-if (-not (Test-Path (Join-Path $Root 'Dockerfile'))) { Exit-WithHint "Dockerfile not found under $Root." 'Run this script from a full clone of the repo.' }
-
-# ---------------------------------------------------------------------------------------
 Write-Step 'Azure account'
-$acct = Invoke-Native -Exe 'az' -Arguments @('account', 'show', '-o', 'json')
-if ($acct.Code -ne 0) { Exit-WithHint 'Not logged in to Azure.' 'az login' }
-if ($Subscription) { Invoke-Az -Arguments @('account', 'set', '--subscription', $Subscription) -What 'Switching subscription' | Out-Null; $acct = Invoke-Native -Exe 'az' -Arguments @('account', 'show', '-o', 'json') }
-$a = $acct.Out | ConvertFrom-Json
-Write-Ok ("{0} ({1})" -f $a.name, $a.id)
-$dom = if ($CustomDomain) { $CustomDomain } else { 'none' }
-Write-Info ("Resource group {0} | app {1} ({2}) | domain: {3} | build: {4} | Bicep: {5}" -f $ResourceGroup, $AppName, $Location, $dom, $doBuild, $doInfra)
+if ($Subscription) { Invoke-Az @('account', 'set', '--subscription', $Subscription) | Out-Null }
+$subId = Invoke-Az @('account', 'show', '--query', 'id', '-o', 'tsv') -AllowFail
+if (-not $subId) { Exit-WithHint 'not signed in to Azure' 'az login' }
+$tenantId = Invoke-Az @('account', 'show', '--query', 'tenantId', '-o', 'tsv')
+Write-Ok ("subscription {0} ({1})" -f (Invoke-Az @('account', 'show', '--query', 'name', '-o', 'tsv')), $subId)
+
 if (-not $Yes) {
-  $answer = Read-Host '    Continue with this subscription? [y/N]'
-  if ($answer -notmatch '^(y|yes)$') { Write-Host 'Stopped. Nothing changed.' -ForegroundColor Yellow; exit 0 }
+  $what = "resource group $ResourceGroup in $Location (Static Web App $Name, $Sku plan"
+  if ($Runner) { $what += ', browser runner' }
+  $answer = Read-Host ("This creates or updates {0}). Continue? [y/N]" -f $what)
+  if ($answer -notmatch '^(y|yes)$') { exit 1 }
 }
 
-# ---------------------------------------------------------------------------------------
-$image = ''
-if ($doInfra) {
-  Write-Step "Resource group $ResourceGroup"
-  $ex = Invoke-Az -Arguments @('group', 'exists', '-n', $ResourceGroup) -What 'Checking the resource group'
-  if ($ex.Out -eq 'true') { Write-Ok 'exists' }
-  else { Invoke-Az -Arguments @('group', 'create', '-n', $ResourceGroup, '-l', $Location, '-o', 'none') -What 'Creating the resource group' | Out-Null; Write-Ok ("created in {0}" -f $Location) }
-  foreach ($ns in @('Microsoft.App', 'Microsoft.ContainerRegistry', 'Microsoft.OperationalInsights', 'Microsoft.Storage', 'Microsoft.ManagedIdentity')) {
-    $st = Invoke-Az -Arguments @('provider', 'show', '-n', $ns, '--query', 'registrationState', '-o', 'tsv') -What 'Reading providers' -AllowFail
-    if ($st.Out -ne 'Registered') { Write-Info ("registering {0}" -f $ns); Invoke-Az -Arguments @('provider', 'register', '-n', $ns, '--wait') -What ("Registering {0}" -f $ns) | Out-Null }
+Write-Step 'Resource providers'
+foreach ($ns in @('Microsoft.Web', 'Microsoft.Storage', 'Microsoft.App')) {
+  if ($ns -eq 'Microsoft.App' -and -not $Runner) { continue }
+  $state = Invoke-Az @('provider', 'show', '-n', $ns, '--query', 'registrationState', '-o', 'tsv') -AllowFail
+  if ($state -ne 'Registered') { Invoke-Az @('provider', 'register', '-n', $ns, '--wait') | Out-Null }
+  Write-Ok $ns
+}
+
+Write-Step 'Resource group'
+Invoke-Az @('group', 'create', '-n', $ResourceGroup, '-l', $Location, '-o', 'none') | Out-Null
+Write-Ok $ResourceGroup
+
+$spObjectId = ''
+$clientId = ''
+if (-not $SkipOidc) {
+  Write-Step 'GitHub sign-in (Entra app + federated credential)'
+  $appDisplay = "$Name-github"
+  $clientId = Invoke-Az @('ad', 'app', 'list', '--display-name', $appDisplay, '--query', '[0].appId', '-o', 'tsv')
+  if (-not $clientId) {
+    $clientId = Invoke-Az @('ad', 'app', 'create', '--display-name', $appDisplay, '--sign-in-audience', 'AzureADMyOrg', '--query', 'appId', '-o', 'tsv')
+    Write-Ok "app registration $appDisplay created"
+  } else { Write-Ok "app registration $appDisplay exists" }
+  $spObjectId = Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '$clientId'", '--query', '[0].id', '-o', 'tsv')
+  if (-not $spObjectId) { $spObjectId = Invoke-Az @('ad', 'sp', 'create', '--id', $clientId, '--query', 'id', '-o', 'tsv') }
+  $subject = "repo:${GitHubRepo}:environment:$EnvironmentName"
+  $count = Invoke-Az @('ad', 'app', 'federated-credential', 'list', '--id', $clientId, '--query', "[?subject=='$subject'] | length(@)", '-o', 'tsv')
+  if ($count -eq '0') {
+    $credName = ("github-$EnvironmentName-$GitHubRepo" -replace '[/.]', '-')
+    if ($credName.Length -gt 100) { $credName = $credName.Substring(0, 100) }
+    $cred = [ordered]@{
+      name        = $credName
+      issuer      = 'https://token.actions.githubusercontent.com'
+      subject     = $subject
+      audiences   = @('api://AzureADTokenExchange')
+      description = "GitHub Actions, $GitHubRepo, environment $EnvironmentName"
+    }
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+      [System.IO.File]::WriteAllText($tmp, ($cred | ConvertTo-Json -Compress))
+      Invoke-Az @('ad', 'app', 'federated-credential', 'create', '--id', $clientId, '--parameters', "@$tmp", '-o', 'none') | Out-Null
+    } finally { Remove-Item -Force $tmp -ErrorAction SilentlyContinue }
+    Write-Ok "federated credential for $subject"
+  } else { Write-Ok "federated credential for $subject exists" }
+}
+
+# Runner image: the deploy workflow publishes ghcr.io/<owner>/agent-ready-check-runner. Until it has run once,
+# a public placeholder keeps the Container App deployable; the workflow swaps in the real image.
+if ($Runner -and -not $RunnerImage) {
+  $RunnerImage = $PlaceholderImage
+  if ($OwnerLc) {
+    $candidate = "ghcr.io/$OwnerLc/agent-ready-check-runner:latest"
+    try {
+      $tok = (Invoke-RestMethod -Uri "https://ghcr.io/token?scope=repository:${OwnerLc}/agent-ready-check-runner:pull" -TimeoutSec 20).token
+      $hdr = @{ Authorization = "Bearer $tok"; Accept = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' }
+      $r = Invoke-WebRequest -Uri "https://ghcr.io/v2/$OwnerLc/agent-ready-check-runner/manifests/latest" -Method Head -Headers $hdr -TimeoutSec 20 -UseBasicParsing
+      if ($r.StatusCode -eq 200) { $RunnerImage = $candidate }
+    } catch { $RunnerImage = $PlaceholderImage }
+    if ($RunnerImage -eq $PlaceholderImage) { Write-Info 'runner image not published yet (or not public); using a placeholder until the deploy workflow runs' }
   }
-  Write-Ok 'resource providers registered'
-  $image = Get-CurrentImage
-  if ($image -like '*k8se/quickstart*') { $image = '' }
-  if (-not (Get-AcrName)) {
-    Write-Step 'Creating the infrastructure (first run, placeholder image)'
-    Write-Info 'Container Apps environment, registry, storage, logs: 2-5 minutes'
-    Invoke-Bicep -Image $image -Tag 'infra'
-    Write-Ok 'infrastructure ready'
-  }
 }
 
-$acr = Get-AcrName
-if (-not $acr) { Exit-WithHint ("No container registry found in {0}." -f $ResourceGroup) 'Run without -UploadOnly first: pwsh ./infra/deploy.ps1' }
-
-if ($doBuild) {
-  Write-Step ("Building the image in Azure Container Registry ({0})" -f $acr)
-  Write-Info 'uploads the repo (see .dockerignore) and builds FROM the Playwright image: 3-6 minutes, output follows when done'
-  $b = Invoke-Native -Exe 'az' -Arguments @('acr', 'build', '-r', $acr, '-t', ("{0}:{1}" -f $ImageRepo, $stamp), '-t', ("{0}:latest" -f $ImageRepo), '--platform', 'linux/amd64', '--only-show-errors', $Root)
-  if ($b.Code -ne 0) {
-    $tail = (($b.Out -split "`n") | Select-Object -Last 30) -join "`n"
-    Write-Host $tail
-    Exit-WithHint ("Image build failed: {0}" -f $b.Err) 'Read the build log above. A failing npm ci usually means package-lock.json is out of date.'
-  }
-  $login = (Invoke-Az -Arguments @('acr', 'show', '-n', $acr, '--query', 'loginServer', '-o', 'tsv') -What 'Reading the registry').Out
-  $image = "{0}/{1}:{2}" -f $login, $ImageRepo, $stamp
-  Write-Ok ("built {0}" -f $image)
-} else {
-  if (-not $image) { $image = Get-CurrentImage }
-  if (-not $image -or $image -like '*k8se/quickstart*') { Exit-WithHint 'No built image to deploy yet.' 'Run without -NoBuild.' }
-  Write-Ok ("re-using {0}" -f $image)
+function Invoke-Deploy([string]$Domain) {
+  $deployName = 'agent-ready-check-' + (Get-Date).ToString('yyyyMMddHHmmss')
+  $runnerFlag = 'false'
+  if ($Runner) { $runnerFlag = 'true' }
+  $json = Invoke-Az @('deployment', 'group', 'create', '-g', $ResourceGroup, '-n', $deployName, '-f', (Join-Path $InfraDir 'main.bicep'),
+    '-p', "appName=$Name", "location=$Location", "swaLocation=$SwaLocation", "swaSku=$Sku", "customDomain=$Domain",
+    "deployBrowserRunner=$runnerFlag", "runnerImage=$RunnerImage", "deployerPrincipalId=$spObjectId",
+    '--query', 'properties.outputs', '-o', 'json')
+  return ($json | ConvertFrom-Json)
 }
 
-if ($doInfra) {
-  Write-Step 'Deploying the app (Bicep)'
-  Invoke-Bicep -Image $image -Tag 'app'
-  Write-Ok 'deployed'
-} elseif ($doBuild) {
-  Write-Step 'Rolling out the new image'
-  Invoke-Az -Arguments @('containerapp', 'update', '-g', $ResourceGroup, '-n', $AppName, '--image', $image, '-o', 'none') -What 'Updating the app' | Out-Null
-  Write-Ok 'rolled out'
-}
+Write-Step 'Deploy infra/main.bicep'
+# A domain is bound only when DNS already points at the app, so the first pass deploys without it (the public origin
+# is then the default host name; it switches to https://<domain> once the domain is bound).
+$out = Invoke-Deploy ''
+$swaName = $out.staticWebAppName.value
+$swaHost = $out.defaultHostname.value
+$runnerApp = $out.runnerAppName.value
+$origin = $out.publicOrigin.value
+Write-Ok "Static Web App $swaName at https://$swaHost"
+if ($runnerApp) { Write-Ok ("browser runner {0} ({1})" -f $runnerApp, $out.runnerFqdn.value) }
 
-$fqdn = (Invoke-Az -Arguments @('containerapp', 'show', '-g', $ResourceGroup, '-n', $AppName, '--query', 'properties.configuration.ingress.fqdn', '-o', 'tsv') -What 'Reading the app').Out
-$url = "https://$fqdn"
-
-# ---------------------------------------------------------------------------------------
+$bound = $false
 if ($CustomDomain) {
   Write-Step "Custom domain $CustomDomain"
-  $envId = (Invoke-Az -Arguments @('containerapp', 'show', '-g', $ResourceGroup, '-n', $AppName, '--query', 'properties.managedEnvironmentId', '-o', 'tsv') -What 'Reading the app').Out
-  $envName = ($envId -split '/')[-1]
-  $verifyId = (Invoke-Az -Arguments @('containerapp', 'env', 'show', '-g', $ResourceGroup, '-n', $envName, '--query', 'properties.customDomainConfiguration.customDomainVerificationId', '-o', 'tsv') -What 'Reading the environment').Out
-  $cname = Get-DnsValue -Name $CustomDomain -Type 'CNAME'
-  $txt = Get-DnsValue -Name ("asuid.{0}" -f $CustomDomain) -Type 'TXT'
-  if ($cname -ne $fqdn -or $txt -ne $verifyId) {
-    Write-Warn2 'DNS is not ready yet. Create these two records (Cloudflare: proxy OFF, grey cloud), then re-run:'
-    $nowC = if ($cname) { $cname } else { 'none' }
-    $nowT = if ($txt) { $txt } else { 'none' }
-    Write-Host ("        CNAME  {0}  ->  {1}        (now: {2})" -f $CustomDomain, $fqdn, $nowC)
-    Write-Host ("        TXT    asuid.{0}  =  {1}   (now: {2})" -f $CustomDomain, $verifyId, $nowT)
-    Write-Host ("        pwsh ./infra/deploy.ps1 -UploadOnly -NoBuild -CustomDomain {0}" -f $CustomDomain)
+  $cname = ''
+  if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
+    try { $cname = (Resolve-DnsName -Name $CustomDomain -Type CNAME -ErrorAction Stop | Where-Object { $_.Type -eq 'CNAME' } | Select-Object -First 1).NameHost } catch { $cname = '' }
+  } elseif (Get-Command dig -ErrorAction SilentlyContinue) {
+    $cname = ((& dig +short CNAME $CustomDomain) | Select-Object -First 1)
+  } elseif (Get-Command nslookup -ErrorAction SilentlyContinue) {
+    $line = (& nslookup -type=CNAME $CustomDomain 2>$null) | Where-Object { $_ -match 'canonical name = ' } | Select-Object -First 1
+    if ($line) { $cname = ($line -split 'canonical name = ')[1] }
+  }
+  if ($cname) { $cname = "$cname".Trim().TrimEnd('.') }
+  if ($cname -eq $swaHost) {
+    Write-Info "CNAME $CustomDomain -> $swaHost found; binding (Azure validates it and issues the certificate, a few minutes)"
+    try {
+      $out = Invoke-Deploy $CustomDomain
+      $origin = $out.publicOrigin.value
+      $bound = $true
+      Write-Ok "bound https://$CustomDomain"
+    } catch { Write-Warn2 'binding failed; DNS may still be propagating. Re-run this script later.' }
   } else {
-    Write-Ok 'CNAME and TXT records found'
-    Invoke-Az -Arguments @('containerapp', 'hostname', 'add', '-g', $ResourceGroup, '-n', $AppName, '--hostname', $CustomDomain, '-o', 'none') -What 'Adding the hostname' -AllowFail | Out-Null
-    Write-Info 'issuing a free managed certificate: up to 10-20 minutes'
-    Invoke-Az -Arguments @('containerapp', 'hostname', 'bind', '-g', $ResourceGroup, '-n', $AppName, '--hostname', $CustomDomain, '--environment', $envName, '--validation-method', 'CNAME', '-o', 'none') -What ("Binding {0} (check that the CNAME is DNS-only, wait a few minutes, re-run)" -f $CustomDomain) | Out-Null
-    Write-Ok ("https://{0} is bound" -f $CustomDomain)
-    $url = "https://$CustomDomain"
+    $seen = $cname
+    if (-not $seen) { $seen = 'missing' }
+    Write-Warn2 ("CNAME for {0} is '{1}', expected {2}. Add the record below, wait for DNS, then re-run (or run the Deploy infra workflow)." -f $CustomDomain, $seen, $swaHost)
   }
 }
 
-# ---------------------------------------------------------------------------------------
-Write-Step "Checking $url"
-$code = 0
-for ($i = 0; $i -lt 18; $i++) {
-  try {
-    $resp = Invoke-WebRequest -Uri ("{0}/api/health" -f $url) -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-    $code = [int]$resp.StatusCode
-  } catch {
-    $code = 0
-    if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-  }
-  if ($code -eq 200) { break }
-  Write-Info ("waiting for the first replica (cold start pulls the image): HTTP {0}" -f $code)
-  Start-Sleep -Seconds 10
-}
-if ($code -eq 200) { Write-Ok ("{0}/api/health -> 200" -f $url) }
-else { Write-Warn2 ("{0}/api/health -> {1} (the app may still be starting; check: az containerapp logs show -g {2} -n {3})" -f $url, $code, $ResourceGroup, $AppName) }
-if (-not $SkipSmoke -and $code -eq 200) {
-  $env:EXPECT_BROWSER = '1'
-  $smoke = Invoke-Native -Exe $py -Arguments @((Join-Path $InfraDir 'check_site.py'), $url)
-  Write-Host $smoke.Out
-  if ($smoke.Code -ne 0) { Write-Warn2 'some smoke checks failed (see above)' }
-}
-
+Write-Step 'Done'
+$hostLabel = 'your subdomain'
+if ($CustomDomain) { $hostLabel = $CustomDomain.Split('.')[0] }
 Write-Host ''
-Write-Host 'Done.' -ForegroundColor White
-Write-Host ("   Site:   {0}" -f $url)
-Write-Host ("   API:    {0}/openapi.json" -f $url)
-Write-Host ("   MCP:    {0}/mcp" -f $url)
-Write-Host ("   Logs:   az containerapp logs show -g {0} -n {1} --follow" -f $ResourceGroup, $AppName)
-Write-Host ("   Remove: az group delete -n {0}   (deletes everything this script created)" -f $ResourceGroup)
+Write-Host 'DNS record to add at the registrar of your domain:'
+Write-Host ("  Type CNAME   Host {0}   Value {1}   TTL 3600" -f $hostLabel, $swaHost)
+Write-Host ''
+Write-Host 'GitHub repository variables (Settings > Secrets and variables > Actions > Variables):'
+$vars = [ordered]@{
+  AZURE_CLIENT_ID       = $clientId
+  AZURE_TENANT_ID       = $tenantId
+  AZURE_SUBSCRIPTION_ID = $subId
+  AZURE_RESOURCE_GROUP  = $ResourceGroup
+  AZURE_STATIC_WEB_APP  = $swaName
+  AZURE_RUNNER_APP      = $runnerApp
+  PUBLIC_BASE_URL       = $origin
+}
+foreach ($k in $vars.Keys) { Write-Host ("  {0,-22} {1}" -f $k, $vars[$k]) }
+
+if ($SetGitHubVariables -and -not $SkipOidc) {
+  if ((Get-Command gh -ErrorAction SilentlyContinue)) {
+    foreach ($k in $vars.Keys) {
+      if (-not $vars[$k]) { continue }
+      & gh variable set $k --repo $GitHubRepo --body $vars[$k]
+      if ($LASTEXITCODE -eq 0) { Write-Ok "variable $k" } else { Write-Warn2 "could not set $k with gh" }
+    }
+  } else { Write-Warn2 'gh is not installed; set the variables by hand (docs/PUBLISHING.md)' }
+}
+if ($CustomDomain -and -not $bound) { Write-Info "custom domain not bound yet: add the CNAME, then re-run with -CustomDomain $CustomDomain" }
+exit 0
